@@ -1,0 +1,24 @@
+[package]
+name = "DecLimiter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pcap = "1.0"
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_System_Threading",
+    "Win32_System_Processes",
+    "Win32_System_SystemServices",
+    "Win32_Security",
+    "Win32_NetworkManagement_Ndis",
+] }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+lazy_static = "1.4"
