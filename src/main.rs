@@ -20,7 +20,7 @@ async fn execute() {
     let filter = "ip";
 
     let handle = WinDivert::network(filter, 0, WinDivertFlags::new().set_fragments()).unwrap();
-    let mut packet = [0u8; 2048];
+    let mut packet = [0u8; 65535];
 
     let mut i: u64 = 0;
     let download_delay_micros = 800; // ADJUST, higher for slower speeds
