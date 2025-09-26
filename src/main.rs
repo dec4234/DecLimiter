@@ -1,31 +1,39 @@
+//! https://github.com/Rubensei/windivert-rust
+//! https://www.reqrypt.org/windivert-doc.html
+
 use std::collections::VecDeque;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
+use tokio::try_join;
 use windivert::WinDivert;
 use windivert::prelude::WinDivertFlags;
 
 const MOV_AVG_WINDOW_SIZE: usize = 500;
 const DELAY_ENABLED: bool = true;
+const FILTER: &str = "ip";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("DecLimiter Starting...");
 
-    execute().await;
+    // execute().await;
+
+    try_join!(flow_capture()).unwrap();
 
     Ok(())
 }
 
 async fn execute() {
-    let filter = "ip";
-
-    let handle = WinDivert::network(filter, 0, WinDivertFlags::new().set_fragments()).unwrap();
+    // https://www.reqrypt.org/windivert-doc.html#filter_language
+    // todo: maybe use flow since it might show PID, must use side-by-side
+    let handle = WinDivert::network(FILTER, 0, WinDivertFlags::new().set_fragments()).unwrap();
     let mut packet = [0u8; 65535];
 
     let mut i: u64 = 0;
     let download_delay_micros = 800; // ADJUST, higher for slower speeds
 
-    let mut window: VecDeque<(Instant, usize)> = VecDeque::with_capacity(1000);
+    let mut window: VecDeque<(Instant, usize)> = VecDeque::with_capacity(100);
 
     loop {
         let res = handle.recv(Some(&mut packet)).unwrap();
@@ -58,7 +66,7 @@ async fn execute() {
             if duration > 0.0 {
                 let total_bytes: usize = window.iter().map(|(_, b)| *b).sum();
                 let bits_per_sec = (total_bytes as f64 * 8.0) / duration;
-                if i % 10 == 0 {
+                if i % 100 == 0 {
                     println!(
                         "Processed {} packets | Moving avg bitrate: {:.2} kbps",
                         i,
@@ -70,4 +78,28 @@ async fn execute() {
             println!("Processed {} packets", i);
         }
     }
+}
+
+fn flow_capture() -> JoinHandle<()> {
+    tokio::spawn(async move {
+        println!("Starting flow capture...");
+
+        let handle = WinDivert::socket("true", 0, WinDivertFlags::new().set_sniff()).unwrap();
+
+        let mut packet = [0u8; 65535];
+        let mut hashset = std::collections::HashSet::new();
+
+        loop {
+            let res = handle.recv(Some(&mut packet)).unwrap();
+
+            let pid = res.address.process_id();
+
+            if hashset.contains(&pid) {
+                continue;
+            } else {
+                hashset.insert(pid);
+                println!("New PID detected: {}", pid);
+            }
+        }
+    })
 }
