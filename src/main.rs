@@ -1,8 +1,13 @@
 //! https://github.com/Rubensei/windivert-rust
 //! https://www.reqrypt.org/windivert-doc.html
 
-use std::collections::VecDeque;
+use derive_new::new;
+use log::{Level, debug, trace};
+use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
+use std::sync::{Arc, Condvar};
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use tokio::try_join;
@@ -15,11 +20,12 @@ const FILTER: &str = "ip";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    simple_logger::init_with_level(Level::Trace).unwrap();
+
     println!("DecLimiter Starting...");
 
-    // execute().await;
-
-    try_join!(flow_capture()).unwrap();
+    let limiter = DecLimiter::new();
+    try_join!(limiter.start()).unwrap();
 
     Ok(())
 }
@@ -80,26 +86,69 @@ async fn execute() {
     }
 }
 
-fn flow_capture() -> JoinHandle<()> {
-    tokio::spawn(async move {
-        println!("Starting flow capture...");
+#[derive(Debug, Copy, Clone, Hash, PartialEq, new, Eq)]
+pub struct FlowAddress {
+    protocol: u8,
+    ip: IpAddr,
+    port: u16,
+}
 
-        let handle = WinDivert::socket("true", 0, WinDivertFlags::new().set_sniff()).unwrap();
+#[derive(Debug, Clone)]
+pub struct DecLimiter {
+    map: Arc<(Mutex<HashMap<FlowAddress, u16>>, Condvar)>, //todo: expiration
+}
 
-        let mut packet = [0u8; 65535];
-        let mut hashset = std::collections::HashSet::new();
+impl DecLimiter {
+    pub fn new() -> Self {
+        let map = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        Self { map }
+    }
 
-        loop {
-            let res = handle.recv(Some(&mut packet)).unwrap();
+    pub fn start(&self) -> JoinHandle<()> {
+        self.map_processid_port()
+    }
 
-            let pid = res.address.process_id();
+    fn map_processid_port(&self) -> JoinHandle<()> {
+        let map = self.map.clone();
 
-            if hashset.contains(&pid) {
-                continue;
-            } else {
-                hashset.insert(pid);
-                println!("New PID detected: {}", pid);
+        tokio::spawn(async move {
+            debug!("Starting process ID to port mapping...");
+
+            let handle = WinDivert::flow("true", 0, WinDivertFlags::new().set_sniff()).unwrap();
+            let mut packet = [0u8; 65535];
+
+            loop {
+                let res = handle.recv(Some(&mut packet)).unwrap();
+
+                let pid = res.address.process_id();
+                let port = res.address.local_port();
+
+                let flow_info = FlowAddress::new(
+                    res.address.protocol(),
+                    res.address.local_address(),
+                    res.address.local_port(),
+                );
+
+                let (lock, cvar) = &*map;
+
+                let mut map_lock = lock.lock().await;
+
+                if !map_lock.contains_key(&flow_info) {
+                    trace!(
+                        "Captured PID: {}, Port: {}, Local Addr: {}, Protocol: {}",
+                        pid, port, flow_info.ip, flow_info.protocol
+                    );
+                    map_lock.insert(flow_info, port);
+                    cvar.notify_all();
+                }
+
+                drop(map_lock); // Explicitly drop the lock
             }
-        }
-    })
+        })
+    }
+
+    // todo
+    pub fn limit_speed_pid(&self, pid: u16, target_byterate: u64) -> JoinHandle<()> {
+        tokio::spawn(async move {})
+    }
 }
