@@ -3,18 +3,6 @@
 version = 4
 
 [[package]]
-name = "DecLimiter"
-version = "0.1.0"
-dependencies = [
- "derive-new",
- "etherparse 0.19.0",
- "log",
- "simple_logger",
- "tokio",
- "windivert",
-]
-
-[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -40,9 +28,9 @@ checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
 name = "cc"
-version = "1.2.38"
+version = "1.2.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80f41ae168f955c12fb8960b057d70d0ca153fb83182b57d86380443527be7e9"
+checksum = "47b26a0954ae34af09b50f0de26458fa95369a0d478d8236d3f93082b219bd29"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -61,6 +49,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "declimiter"
+version = "0.1.0"
+dependencies = [
+ "declimiter-lib",
+ "log",
+ "simple_logger",
+ "tokio",
+]
+
+[[package]]
+name = "declimiter-lib"
+version = "0.1.0"
+dependencies = [
+ "derive-new",
+ "etherparse 0.19.0",
+ "log",
+ "tokio",
+ "windivert",
 ]
 
 [[package]]
@@ -103,9 +112,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.2"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ced73b1dacfc750a6db6c0a0c3a3853c8b41997e2e2c563dc90804ae6867959"
+checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "itoa"
