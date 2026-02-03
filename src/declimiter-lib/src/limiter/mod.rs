@@ -33,20 +33,29 @@ impl DecLimiter {
 
 	/// Get the PID associated with a given flow address.
 	///
+	/// # Arguments
+	/// * `map` - An `Arc<Mutex<HashMap<FlowAddress, FlowEntry>>>` containing the flow to PID mappings.
+	/// * `flow` - A reference to the `FlowAddress` to look up.
+	///
 	/// # Returns
 	/// An `Option<u16>` containing the PID if found, or `None` if not found.
-	pub async fn pid_from_flow(&self, flow: &FlowAddress) -> Option<u32> {
-		let map_lock = self.map.lock().await;
+	pub async fn pid_from_flow(map: Arc<Mutex<HashMap<FlowAddress, FlowEntry>>>, flow: &FlowAddress) -> Option<u32> {
+		let map_lock = map.lock().await;
 
 		map_lock.get(flow).copied().map(|entry| entry.pid)
 	}
 
 	/// Check if the given PID matches the PID associated with the given flow address.
 	///
+	/// # Arguments
+	/// * `map` - An `Arc<Mutex<HashMap<FlowAddress, FlowEntry>>>` containing the flow to PID mappings.
+	/// * `flow` - A reference to the `FlowAddress` to look up.
+	/// * `pid` - The PID to compare against.
+	///
 	/// # Returns
 	/// `true` if the PIDs match, `false` if there is no pid mapped or they do not match.
-	pub async fn pid_matches(&self, flow: &FlowAddress, pid: u32) -> bool {
-		self.pid_from_flow(flow).await.map_or(false, |mapped_pid| mapped_pid == pid)
+	pub async fn pid_matches(map: Arc<Mutex<HashMap<FlowAddress, FlowEntry>>>, flow: &FlowAddress, pid: u32) -> bool {
+		Self::pid_from_flow(map, flow).await.map_or(false, |mapped_pid| mapped_pid == pid)
 	}
 
 	/// Listens for packets and maps process IDs to their corresponding addresses.
@@ -119,11 +128,7 @@ impl DecLimiter {
 					continue;
 				};
 
-				// todo: replace with pid_matches
-				let pid_match = {
-					let map_lock = map.lock().await;
-					map_lock.get(&flow).map_or(false, |entry| entry.pid == pid)
-				};
+				let pid_match = Self::pid_matches(map.clone(), &flow, pid).await;
 
 				if pid_match {
 					let now = Instant::now();
@@ -150,8 +155,7 @@ impl DecLimiter {
 							let kp = 0.0005;
 							dynamic_delay_us += (error * kp) as i64;
 
-							dynamic_delay_us = dynamic_delay_us
-								.clamp(0, max_delay_us);
+							dynamic_delay_us = dynamic_delay_us.clamp(0, max_delay_us);
 
 							if dynamic_delay_us > 0 {
 								sleep(Duration::from_micros(dynamic_delay_us as u64)).await;
@@ -190,7 +194,7 @@ impl DecLimiter {
 				map_lock.retain(|flow, entry| {
 					let age = now.duration_since(entry.last_seen);
 					if age > max_age {
-						trace!("Removing stale flow entry: {:?}, last seen: {:?}", flow, entry.last_seen);
+						trace!("Removing stale flow entry: {flow:?}");
 						false
 					} else {
 						true
