@@ -1,6 +1,12 @@
 use crate::error::DecLimiterError;
 
+/// Regex pattern to match datarate strings.
+/// Captures integer and fractional parts, unit suffix, and optional "bps".
+/// Examples of valid strings: "100Kbps", "1.5M", "2000", "3.25G".
 const REGEX: &str = r"^([0-9]+)(?:\.([0-9]+))?([KMGTPkmgpt]?)(bps)?$";
+
+/// Type alias for datarate values in bits per second.
+pub type Datarate = u64;
 
 /// Parses a datarate string (e.g., "100Kbps", "1.5M") into its equivalent value in bits per second.
 ///
@@ -18,7 +24,7 @@ const REGEX: &str = r"^([0-9]+)(?:\.([0-9]+))?([KMGTPkmgpt]?)(bps)?$";
 /// # Returns
 /// * `Ok(u64)` - The parsed datarate in bits per second.
 /// * `Err(DecLimiterError)` - If the input string is invalid or cannot be parsed.
-pub fn parse_datarate(input: &str) -> Result<u64, DecLimiterError> {
+pub fn parse_datarate(input: &str) -> Result<Datarate, DecLimiterError> {
 	let re = regex::Regex::new(REGEX)
 		.map_err(|e| DecLimiterError::ParseDatarateError(e.to_string()))?;
 

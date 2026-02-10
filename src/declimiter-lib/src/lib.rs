@@ -1,3 +1,3 @@
 pub mod limiter;
-pub(crate) mod util;
+pub mod util;
 mod error;

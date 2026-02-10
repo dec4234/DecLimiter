@@ -4,19 +4,28 @@
 //!
 //! Missing SYS error? - `sc delete WinDivert`
 
-use std::time::Duration;
-use declimiter_lib::limiter::DecLimiter;
-use log::Level;
-use tokio::try_join;
+mod cli;
+mod error;
+
+use clap::Parser;
+use log::{debug, Level};
+use crate::cli::{execute, DecLimiterArgs};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    simple_logger::init_with_level(Level::Trace).unwrap();
+    simple_logger::init_with_level(Level::Trace)?;
 
-    println!("DecLimiter Starting...");
+    debug!("DecLimiter Starting...");
 
-    let limiter = DecLimiter::new();
-    try_join!(limiter.start(), limiter.limit_speed_pid(33092, 500_000), limiter.garbage_collect_flows(Duration::from_secs(100))).unwrap();
+    let args = DecLimiterArgs::parse();
+    
+    execute(args).await?;
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_limiter() {
+    let limiter = declimiter_lib::limiter::DecLimiter::new();
+    tokio::try_join!(limiter.start(), limiter.limit_speed_pid(33092, 500_000), limiter.garbage_collect_flows(std::time::Duration::from_secs(100))).unwrap();
 }

@@ -92,7 +92,7 @@ impl DecLimiter {
 		})
 	}
 
-	/// Limit the download speed for a specific PID using a PID-based speed limiter.
+	/// Limit the download speed for a specific process via its PID.
 	///
 	/// # Arguments
 	/// * `pid` - The process ID to limit.

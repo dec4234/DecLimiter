@@ -7,4 +7,8 @@ edition = "2024"
 tokio = { version = "1.49.0", features = ["full"] }
 log = "0.4.29"
 simple_logger = "5.1.0"
+clap = { version = "4.5.49", features = ["default", "color", "help", "suggestions", "error-context"] }
+clap_derive = "4.5.49"
 declimiter-lib = { path = "src/declimiter-lib"}
+thiserror = "2.0.18"
+futures = { version = "0.3.31", features = []}
