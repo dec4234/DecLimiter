@@ -2,7 +2,7 @@ pub mod network;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::time::Duration;
 use etherparse::{InternetSlice, SlicedPacket, TransportSlice};
 use log::{debug, error, trace};
@@ -13,6 +13,8 @@ use windivert::prelude::WinDivertFlags;
 use windivert::WinDivert;
 use network::FlowAddress;
 use crate::limiter::network::FlowEntry;
+
+pub type ProcessPair = (u32, String);
 
 const MOV_AVG_WINDOW_SIZE: usize = 500;
 
@@ -151,8 +153,9 @@ impl DecLimiter {
 
 							let error = actual_rate - target_byterate as f64;
 
+							// todo: allow multiplier to be configurable
 							// Simple proportional controller
-							let kp = 0.0005;
+							let kp = 0.02; // higher = more aggressive, lower = smoother but slower response
 							dynamic_delay_us += (error * kp) as i64;
 
 							dynamic_delay_us = dynamic_delay_us.clamp(0, max_delay_us);

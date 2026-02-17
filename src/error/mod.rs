@@ -6,4 +6,8 @@ pub enum LimiterCLIError {
 	PIDInvalid(String),
 	#[error("Failed to parse datarate: {0}")]
 	ExecutionError(String),
+	#[error("IO error: {0}")]
+	IOError(#[from] std::io::Error),
+	#[error("User aborted the operation")]
+	UserAbort
 }

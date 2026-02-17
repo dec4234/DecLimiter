@@ -12,3 +12,4 @@ clap_derive = "4.5.49"
 declimiter-lib = { path = "src/declimiter-lib"}
 thiserror = "2.0.18"
 futures = { version = "0.3.31", features = []}
+ratatui = "0.30.0"

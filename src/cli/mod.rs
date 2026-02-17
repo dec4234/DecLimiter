@@ -1,9 +1,30 @@
+mod process_list;
+
 use std::time::Duration;
+use clap::Parser;
 use declimiter_lib::util::parse_datarate;
 use clap_derive::{Parser};
+use futures::try_join;
 use declimiter_lib::limiter::DecLimiter;
 use declimiter_lib::util::Datarate;
+use crate::cli::process_list::init_search;
 use crate::error::LimiterCLIError;
+
+pub async fn handle_startup() -> Result<(), Box<dyn std::error::Error>> {
+	if let Ok(args) = DecLimiterArgs::try_parse() {
+		execute(args).await?;
+	} else {
+		if let Some((proc, speed)) = init_search()? {
+			let limiter = DecLimiter::new();
+			// todo: return handle for more precise management
+			try_join!(limiter.start(), limiter.limit_speed_pid(proc.0, speed), limiter.garbage_collect_flows(Duration::from_secs(60)))?;
+		} else {
+			println!("No process selected. Exiting.");
+		}
+	}
+
+	Ok(())
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]

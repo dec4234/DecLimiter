@@ -1,4 +1,7 @@
+use std::ffi::OsStr;
+use sysinfo::{Pid, ProcessesToUpdate, RefreshKind, System};
 use crate::error::DecLimiterError;
+use crate::limiter::ProcessPair;
 
 /// Regex pattern to match datarate strings.
 /// Captures integer and fractional parts, unit suffix, and optional "bps".
@@ -65,6 +68,37 @@ fn multiple(unit: &str) -> u64 {
 		"P" | "p" => 1_000_000_000_000_000,
 		_ => 1,
 	}
+}
+
+/// Retrieves the process name for a given PID using the sysinfo crate.
+/// Returns None if the PID does not exist or cannot be accessed.
+pub fn get_process_name(pid: u32) -> Option<String> {
+	let mut sys = System::new();
+
+	let sys_pid = Pid::from_u32(pid);
+	sys.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
+
+	sys.process(sys_pid).map(|p| p.name().to_string_lossy().into_owned())
+}
+
+/// Finds all processes matching a given process name
+///
+/// # Arguments
+/// * `process_name` - The name of the process to search for (e.g., "chrome.exe").
+///
+/// # Returns
+/// A vector of PIDs (`Vec<(u32, String)>`) found with that name. u32 is pid and String is the process name.
+pub fn find_process(process_name: &str) -> Vec<ProcessPair> {
+	let refresh_kind = RefreshKind::everything();
+	let sys = System::new_with_specifics(refresh_kind);
+
+	let mut vec = Vec::new();
+
+	for p in sys.processes_by_name(OsStr::new(process_name)) {
+		vec.push((p.pid().as_u32(), p.name().to_str().unwrap_or("").to_string()));
+	}
+
+	vec
 }
 
 #[cfg(test)]

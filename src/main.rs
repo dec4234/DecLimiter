@@ -7,25 +7,20 @@
 mod cli;
 mod error;
 
-use clap::Parser;
 use log::{debug, Level};
-use crate::cli::{execute, DecLimiterArgs};
+use crate::cli::{handle_startup};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    simple_logger::init_with_level(Level::Trace)?;
+async fn main() {
+    simple_logger::init_with_level(Level::Trace).unwrap();
 
     debug!("DecLimiter Starting...");
 
-    let args = DecLimiterArgs::parse();
-    
-    execute(args).await?;
-
-    Ok(())
+    handle_startup().await.unwrap(); // todo: called `Result::unwrap()` on an `Err` value: Open(AccessDenied)
 }
 
 #[tokio::test]
 async fn test_limiter() {
     let limiter = declimiter_lib::limiter::DecLimiter::new();
-    tokio::try_join!(limiter.start(), limiter.limit_speed_pid(33092, 500_000), limiter.garbage_collect_flows(std::time::Duration::from_secs(100))).unwrap();
+    tokio::try_join!(limiter.start(), limiter.limit_speed_pid(44188, 500), limiter.garbage_collect_flows(std::time::Duration::from_secs(100))).unwrap();
 }

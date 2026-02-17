@@ -11,3 +11,4 @@ derive-new = "0.7.0"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "sync", "time"]}
 thiserror = "2.0.18"
 regex = "1.12.2"
+sysinfo = { version = "0.38.2", features = ["windows", "default"]}
