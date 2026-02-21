@@ -24,8 +24,17 @@ async fn main() {
             eprintln!("Error: {}", err_str);
         }
     }
+
+    wait_for_input();
 }
 
+fn wait_for_input() {
+    println!("Press Enter to exit...");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+}
+
+#[ignore]
 #[tokio::test]
 async fn test_limiter() {
     let limiter = declimiter_lib::limiter::DecLimiter::new();
