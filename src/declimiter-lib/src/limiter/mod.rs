@@ -12,6 +12,7 @@ use tokio::time::{sleep, Instant};
 use windivert::prelude::WinDivertFlags;
 use windivert::WinDivert;
 use network::FlowAddress;
+use crate::error::DecLimiterError;
 use crate::limiter::network::FlowEntry;
 
 pub type ProcessPair = (u32, String);
@@ -29,7 +30,7 @@ impl DecLimiter {
 		Self { map }
 	}
 
-	pub fn start(&self) -> JoinHandle<()> {
+	pub fn start(&self) -> JoinHandle<Result<(), DecLimiterError>> {
 		self.map_processid_port()
 	}
 
@@ -64,17 +65,17 @@ impl DecLimiter {
 	///
 	/// # Returns
 	/// A `JoinHandle<()>` for the spawned task.
-	fn map_processid_port(&self) -> JoinHandle<()> {
+	fn map_processid_port(&self) -> JoinHandle<Result<(), DecLimiterError>> {
 		let map = self.map.clone();
 
 		tokio::spawn(async move {
 			debug!("Starting process ID to port mapping...");
 
-			let handle = WinDivert::flow("tcp or udp", 0, WinDivertFlags::new().set_sniff()).unwrap();
+			let handle = WinDivert::flow("tcp or udp", 0, WinDivertFlags::new().set_sniff())?;
 			let mut packet = [0u8; 65535];
 
 			loop {
-				let res = handle.recv(Some(&mut packet)).unwrap();
+				let res = handle.recv(Some(&mut packet))?;
 
 				let pid = res.address.process_id();
 				let port = res.address.local_port();
@@ -102,14 +103,14 @@ impl DecLimiter {
 	///
 	/// # Returns
 	/// A `JoinHandle<()>` for the spawned task.
-	pub fn limit_speed_pid(&self, pid: u32, target_byterate: u64) -> JoinHandle<()> {
+	pub fn limit_speed_pid(&self, pid: u32, target_byterate: u64) -> JoinHandle<Result<(), DecLimiterError>> {
 		let map = self.map.clone();
 
 		tokio::spawn(async move {
 			debug!("Starting speed limiter for PID: {}...", pid);
 
 			// Priority is set to 1 so it doesn't usurp the flow capture. This may not be necessary.
-			let handle = WinDivert::network("ip and (tcp or udp)", 1, WinDivertFlags::new().set_fragments()).unwrap();
+			let handle = WinDivert::network("ip and (tcp or udp)", 1, WinDivertFlags::new().set_fragments())?;
 			let mut packet = [0u8; 65535];
 
 			let mut window: VecDeque<(Instant, usize)> = VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE);
@@ -118,10 +119,10 @@ impl DecLimiter {
 			let max_delay_us: i64 = 10_000;
 
 			loop {
-				let res = handle.recv(Some(&mut packet)).unwrap();
+				let res = handle.recv(Some(&mut packet))?;
 
 				if res.address.outbound() {
-					handle.send(&res).unwrap();
+					handle.send(&res)?;
 					continue;
 				}
 
@@ -172,6 +173,8 @@ impl DecLimiter {
 					break;
 				}
 			}
+
+			Ok(())
 		})
 	}
 
@@ -182,7 +185,7 @@ impl DecLimiter {
 	///
 	/// # Returns
 	/// A `JoinHandle<()>` for the spawned task.
-	pub fn garbage_collect_flows(&self, max_age: Duration) -> JoinHandle<()> {
+	pub fn garbage_collect_flows(&self, max_age: Duration) -> JoinHandle<Result<(), DecLimiterError>> {
 		let map = self.map.clone();
 
 		tokio::spawn(async move {

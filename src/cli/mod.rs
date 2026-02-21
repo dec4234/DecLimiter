@@ -10,14 +10,20 @@ use declimiter_lib::util::Datarate;
 use crate::cli::process_list::init_search;
 use crate::error::LimiterCLIError;
 
-pub async fn handle_startup() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_startup() -> Result<(), LimiterCLIError> {
 	if let Ok(args) = DecLimiterArgs::try_parse() {
 		execute(args).await?;
 	} else {
 		if let Some((proc, speed)) = init_search()? {
 			let limiter = DecLimiter::new();
-			// todo: return handle for more precise management
-			try_join!(limiter.start(), limiter.limit_speed_pid(proc.0, speed), limiter.garbage_collect_flows(Duration::from_secs(60)))?;
+
+			// this weird join is needed to capture errors from the lower spawned tasks
+			try_join!(
+                async { limiter.start().await.expect("Task panicked") },
+                async { limiter.limit_speed_pid(proc.0, speed).await.expect("Task panicked") },
+                async { limiter.garbage_collect_flows(Duration::from_secs(60)).await.expect("Task panicked") }
+            )
+				.map_err(|e| LimiterCLIError::ExecutionError(e.to_string()))?;
 		} else {
 			println!("No process selected. Exiting.");
 		}

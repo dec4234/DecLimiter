@@ -1,3 +1,3 @@
 pub mod limiter;
 pub mod util;
-mod error;
+pub mod error;

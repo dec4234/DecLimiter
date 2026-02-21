@@ -16,7 +16,14 @@ async fn main() {
 
     debug!("DecLimiter Starting...");
 
-    handle_startup().await.unwrap(); // todo: called `Result::unwrap()` on an `Err` value: Open(AccessDenied)
+    if let Err(e) = handle_startup().await {
+        let err_str = e.to_string();
+        if err_str.contains("Running without elevated access rights") {
+            eprintln!("Error: Access denied. Please run DecLimiter as Administrator.");
+        } else {
+            eprintln!("Error: {}", err_str);
+        }
+    }
 }
 
 #[tokio::test]
