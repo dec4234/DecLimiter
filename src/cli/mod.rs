@@ -1,14 +1,14 @@
 mod process_list;
 
-use std::time::Duration;
-use clap::Parser;
-use declimiter_lib::util::parse_datarate;
-use clap_derive::{Parser};
-use futures::try_join;
-use declimiter_lib::limiter::DecLimiter;
-use declimiter_lib::util::Datarate;
 use crate::cli::process_list::init_search;
 use crate::error::LimiterCLIError;
+use clap::Parser;
+use clap_derive::Parser;
+use declimiter_lib::limiter::DecLimiter;
+use declimiter_lib::util::Datarate;
+use declimiter_lib::util::parse_datarate;
+use futures::try_join;
+use std::time::Duration;
 
 pub async fn handle_startup() -> Result<(), LimiterCLIError> {
 	if let Ok(args) = DecLimiterArgs::try_parse() {
@@ -19,11 +19,11 @@ pub async fn handle_startup() -> Result<(), LimiterCLIError> {
 
 			// this weird join is needed to capture errors from the lower spawned tasks
 			try_join!(
-                async { limiter.start().await.expect("Task panicked") },
-                async { limiter.limit_speed_pid(proc.0, speed).await.expect("Task panicked") },
-                async { limiter.garbage_collect_flows(Duration::from_secs(60)).await.expect("Task panicked") }
-            )
-				.map_err(|e| LimiterCLIError::ExecutionError(e.to_string()))?;
+				async { limiter.start().await.expect("Task panicked") },
+				async { limiter.limit_download_speed_pid(proc.0, speed).await.expect("Task panicked") },
+				async { limiter.garbage_collect_flows(Duration::from_secs(60)).await.expect("Task panicked") }
+			)
+			.map_err(|e| LimiterCLIError::ExecutionError(e.to_string()))?;
 		} else {
 			println!("No process selected. Exiting.");
 		}
@@ -38,7 +38,7 @@ pub struct DecLimiterArgs {
 	/// PID of the process to manage
 	#[arg(short, long)]
 	pub pid: u32,
-	
+
 	/// Download speed limit (e.g., "10mbps", "500kbps")
 	#[arg(short, long, value_parser = parse_datarate)]
 	pub download: Option<Datarate>,
@@ -49,7 +49,7 @@ pub struct DecLimiterArgs {
 
 	/// Garbage collection interval in seconds
 	#[arg(short, long, default_value_t = 60)]
-	pub garbage_collect: u32
+	pub garbage_collect: u32,
 }
 
 pub async fn execute(args: DecLimiterArgs) -> Result<(), LimiterCLIError> {
@@ -58,13 +58,12 @@ pub async fn execute(args: DecLimiterArgs) -> Result<(), LimiterCLIError> {
 	let mut vec = vec![limiter.garbage_collect_flows(Duration::from_secs(args.garbage_collect as u64))];
 
 	if let Some(download_rate) = args.download {
-		vec.push(limiter.limit_speed_pid(args.pid, download_rate));
+		vec.push(limiter.limit_download_speed_pid(args.pid, download_rate));
 	}
 
-	// todo: implement upload limiting
-	/*if let Some(upload_rate) = args.upload {
-		vec.push(limiter.limit_speed_pid(args.pid, upload_rate));
-	}*/
+	if let Some(upload_rate) = args.upload {
+		vec.push(limiter.limit_upload_speed_pid(args.pid, upload_rate));
+	}
 
 	futures::future::try_join_all(vec).await.map_err(|e| LimiterCLIError::ExecutionError(e.to_string()))?;
 

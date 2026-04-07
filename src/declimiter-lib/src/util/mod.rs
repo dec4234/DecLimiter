@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use sysinfo::{Pid, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use crate::error::DecLimiterError;
 use crate::limiter::ProcessPair;
 
@@ -89,7 +89,7 @@ pub fn get_process_name(pid: u32) -> Option<String> {
 /// # Returns
 /// A vector of PIDs (`Vec<(u32, String)>`) found with that name. u32 is pid and String is the process name.
 pub fn find_process(process_name: &str) -> Vec<ProcessPair> {
-	let refresh_kind = RefreshKind::everything();
+	let refresh_kind = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
 	let sys = System::new_with_specifics(refresh_kind);
 
 	let mut vec = Vec::new();

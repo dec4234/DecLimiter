@@ -1,19 +1,19 @@
 pub mod network;
 
+use crate::error::DecLimiterError;
+use crate::limiter::network::FlowEntry;
+use etherparse::{InternetSlice, SlicedPacket, TransportSlice};
+use log::{debug, error, trace};
+use network::FlowAddress;
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use etherparse::{InternetSlice, SlicedPacket, TransportSlice};
-use log::{debug, error, trace};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, Instant};
-use windivert::prelude::WinDivertFlags;
+use tokio::time::{Instant, sleep};
 use windivert::WinDivert;
-use network::FlowAddress;
-use crate::error::DecLimiterError;
-use crate::limiter::network::FlowEntry;
+use windivert::prelude::WinDivertFlags;
 
 pub type ProcessPair = (u32, String);
 
@@ -80,10 +80,7 @@ impl DecLimiter {
 				let pid = res.address.process_id();
 				let port = res.address.local_port();
 
-				let flow_info = FlowAddress::new(
-					res.address.local_address(),
-					res.address.local_port(),
-				);
+				let flow_info = FlowAddress::new(res.address.local_address(), res.address.local_port());
 
 				let mut map_lock = map.lock().await;
 
@@ -103,11 +100,11 @@ impl DecLimiter {
 	///
 	/// # Returns
 	/// A `JoinHandle<()>` for the spawned task.
-	pub fn limit_speed_pid(&self, pid: u32, target_byterate: u64) -> JoinHandle<Result<(), DecLimiterError>> {
+	pub fn limit_download_speed_pid(&self, pid: u32, target_byterate: u64) -> JoinHandle<Result<(), DecLimiterError>> {
 		let map = self.map.clone();
 
 		tokio::spawn(async move {
-			debug!("Starting speed limiter for PID: {}...", pid);
+			debug!("Starting download speed limiter for PID: {}...", pid);
 
 			// Priority is set to 1 so it doesn't usurp the flow capture. This may not be necessary.
 			let handle = WinDivert::network("ip and (tcp or udp)", 1, WinDivertFlags::new().set_fragments())?;
@@ -126,7 +123,7 @@ impl DecLimiter {
 					continue;
 				}
 
-				let Some(flow) = parse_flow(&res.data) else {
+				let Some(flow) = parse_flow_dest(&res.data) else {
 					error!("Failed to parse flow from packet: {:?}", &res.data[..20]);
 					continue;
 				};
@@ -134,38 +131,58 @@ impl DecLimiter {
 				let pid_match = Self::pid_matches(map.clone(), &flow, pid).await;
 
 				if pid_match {
-					let now = Instant::now();
-					let bytes = res.data.len();
+					throttle_packet(&mut window, &mut dynamic_delay_us, max_delay_us, target_byterate, res.data.len()).await;
+				}
 
-					window.push_back((now, bytes));
-					if window.len() > MOV_AVG_WINDOW_SIZE {
-						window.pop_front();
-					}
+				if let Err(e) = handle.send(&res) {
+					error!("Error returning packet: {}", e);
+					break;
+				}
+			}
 
-					if window.len() > 1 {
-						let first = window.front().unwrap().0;
-						let last = window.back().unwrap().0;
+			Ok(())
+		})
+	}
 
-						let duration = last.duration_since(first).as_secs_f64();
-						if duration > 0.0 {
-							let total_bytes: usize = window.iter().map(|(_, b)| *b).sum();
+	/// Limit the upload speed for a specific process via its PID.
+	///
+	/// # Arguments
+	/// * `pid` - The process ID to limit.
+	/// * `target_byterate` - The target byte rate in bytes per second.
+	///
+	/// # Returns
+	/// A `JoinHandle<()>` for the spawned task.
+	pub fn limit_upload_speed_pid(&self, pid: u32, target_byterate: u64) -> JoinHandle<Result<(), DecLimiterError>> {
+		let map = self.map.clone();
 
-							let actual_rate = total_bytes as f64 / duration;
+		tokio::spawn(async move {
+			debug!("Starting upload speed limiter for PID: {}...", pid);
 
-							let error = actual_rate - target_byterate as f64;
+			let handle = WinDivert::network("ip and (tcp or udp)", 2, WinDivertFlags::new().set_fragments())?;
+			let mut packet = [0u8; 65535];
 
-							// todo: allow multiplier to be configurable
-							// Simple proportional controller
-							let kp = 0.02; // higher = more aggressive, lower = smoother but slower response
-							dynamic_delay_us += (error * kp) as i64;
+			let mut window: VecDeque<(Instant, usize)> = VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE);
 
-							dynamic_delay_us = dynamic_delay_us.clamp(0, max_delay_us);
+			let mut dynamic_delay_us: i64 = 0;
+			let max_delay_us: i64 = 10_000;
 
-							if dynamic_delay_us > 0 {
-								sleep(Duration::from_micros(dynamic_delay_us as u64)).await;
-							}
-						}
-					}
+			loop {
+				let res = handle.recv(Some(&mut packet))?;
+
+				if !res.address.outbound() {
+					handle.send(&res)?;
+					continue;
+				}
+
+				let Some(flow) = parse_flow_source(&res.data) else {
+					error!("Failed to parse flow from packet: {:?}", &res.data[..20]);
+					continue;
+				};
+
+				let pid_match = Self::pid_matches(map.clone(), &flow, pid).await;
+
+				if pid_match {
+					throttle_packet(&mut window, &mut dynamic_delay_us, max_delay_us, target_byterate, res.data.len()).await;
 				}
 
 				if let Err(e) = handle.send(&res) {
@@ -211,14 +228,38 @@ impl DecLimiter {
 	}
 }
 
+/// Apply throttling by tracking a moving average window and sleeping to limit throughput.
+async fn throttle_packet(window: &mut VecDeque<(Instant, usize)>, dynamic_delay_us: &mut i64, max_delay_us: i64, target_byterate: u64, bytes: usize) {
+	let now = Instant::now();
+
+	window.push_back((now, bytes));
+	if window.len() > MOV_AVG_WINDOW_SIZE {
+		window.pop_front();
+	}
+
+	if window.len() > 1 {
+		let first = window.front().unwrap().0;
+		let last = window.back().unwrap().0;
+
+		let duration = last.duration_since(first).as_secs_f64();
+		if duration > 0.0 {
+			let total_bytes: usize = window.iter().map(|(_, b)| *b).sum();
+			let actual_rate = total_bytes as f64 / duration;
+			let error = actual_rate - target_byterate as f64;
+
+			let kp = 0.02;
+			*dynamic_delay_us += (error * kp) as i64;
+			*dynamic_delay_us = (*dynamic_delay_us).clamp(0, max_delay_us);
+
+			if *dynamic_delay_us > 0 {
+				sleep(Duration::from_micros(*dynamic_delay_us as u64)).await;
+			}
+		}
+	}
+}
+
 /// Parse the flow address (destination IP and port) from a raw packet.
-///
-/// # Arguments
-/// * `packet` - A byte slice representing the raw packet data.
-///
-/// # Returns
-/// An `Option<FlowAddress>` containing the parsed flow address, or `None` if parsing fails.
-fn parse_flow(packet: &[u8]) -> Option<FlowAddress> {
+fn parse_flow_dest(packet: &[u8]) -> Option<FlowAddress> {
 	let sliced = SlicedPacket::from_ip(packet).ok()?;
 
 	let ip = match sliced.net? {
@@ -228,12 +269,26 @@ fn parse_flow(packet: &[u8]) -> Option<FlowAddress> {
 	};
 
 	match sliced.transport? {
-		TransportSlice::Tcp(tcp) => {
-			Some(FlowAddress::new(ip, tcp.destination_port()))
-		}
-		TransportSlice::Udp(udp) => {
-			Some(FlowAddress::new(ip, udp.destination_port()))
-		}
+		TransportSlice::Tcp(tcp) => Some(FlowAddress::new(ip, tcp.destination_port())),
+		TransportSlice::Udp(udp) => Some(FlowAddress::new(ip, udp.destination_port())),
+		_ => None,
+	}
+}
+
+/// Parse the flow address (source IP and port) from a raw packet.
+/// Used for matching outbound packets to their originating process.
+fn parse_flow_source(packet: &[u8]) -> Option<FlowAddress> {
+	let sliced = SlicedPacket::from_ip(packet).ok()?;
+
+	let ip = match sliced.net? {
+		InternetSlice::Ipv4(h) => IpAddr::V4(h.header().source_addr()),
+		InternetSlice::Ipv6(h) => IpAddr::V6(h.header().source_addr()),
+		_ => return None,
+	};
+
+	match sliced.transport? {
+		TransportSlice::Tcp(tcp) => Some(FlowAddress::new(ip, tcp.source_port())),
+		TransportSlice::Udp(udp) => Some(FlowAddress::new(ip, udp.source_port())),
 		_ => None,
 	}
 }

@@ -36,7 +36,6 @@ There are 2 provided ways to limit the speed of a process.
 - Each instance of DecLimiter currently can only handle 1 process
 
 ## Immediate Todo
-- [ ] Implement upload speed limiter
 - [ ] Implement a way to only show processes that use the network card in the selection list
 - [ ] Implement a way to control multiple processes with one instance of DecLimiter
 - [ ] Block upload/download completely for a process
