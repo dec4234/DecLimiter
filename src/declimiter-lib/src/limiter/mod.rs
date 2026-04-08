@@ -72,10 +72,9 @@ impl DecLimiter {
 			debug!("Starting process ID to port mapping...");
 
 			let handle = WinDivert::flow("tcp or udp", 0, WinDivertFlags::new().set_sniff())?;
-			let mut packet = [0u8; 65535];
 
 			loop {
-				let res = handle.recv(Some(&mut packet))?;
+				let res = handle.recv()?;
 
 				let pid = res.address.process_id();
 				let port = res.address.local_port();
@@ -108,7 +107,7 @@ impl DecLimiter {
 
 			// Priority is set to 1 so it doesn't usurp the flow capture. This may not be necessary.
 			let handle = WinDivert::network("ip and (tcp or udp)", 1, WinDivertFlags::new().set_fragments())?;
-			let mut packet = [0u8; 65535];
+			let mut packet = vec![0u8; 65535];
 
 			let mut window: VecDeque<(Instant, usize)> = VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE);
 
@@ -116,7 +115,7 @@ impl DecLimiter {
 			let max_delay_us: i64 = 10_000;
 
 			loop {
-				let res = handle.recv(Some(&mut packet))?;
+				let res = handle.recv(&mut packet)?;
 
 				if res.address.outbound() {
 					handle.send(&res)?;
@@ -159,7 +158,7 @@ impl DecLimiter {
 			debug!("Starting upload speed limiter for PID: {}...", pid);
 
 			let handle = WinDivert::network("ip and (tcp or udp)", 2, WinDivertFlags::new().set_fragments())?;
-			let mut packet = [0u8; 65535];
+			let mut packet = vec![0u8; 65535];
 
 			let mut window: VecDeque<(Instant, usize)> = VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE);
 
@@ -167,7 +166,7 @@ impl DecLimiter {
 			let max_delay_us: i64 = 10_000;
 
 			loop {
-				let res = handle.recv(Some(&mut packet))?;
+				let res = handle.recv(&mut packet)?;
 
 				if !res.address.outbound() {
 					handle.send(&res)?;
