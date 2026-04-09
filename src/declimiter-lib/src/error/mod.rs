@@ -1,5 +1,4 @@
 use thiserror::Error;
-use windivert::error::WinDivertError;
 
 #[derive(Debug, Error)]
 pub enum DecLimiterError {
@@ -7,6 +6,8 @@ pub enum DecLimiterError {
 	ParseDatarateError(String),
 	#[error("Failed to parse integer: {0}")]
 	ParseFloatError(#[from] std::num::ParseFloatError),
-	#[error("WinDivert error: {0}")]
-	WinDivertError(#[from] WinDivertError),
+	#[error("Windows error: {0}")]
+	WindowsError(#[from] windows::core::Error),
+	#[error("No network adapter found")]
+	NoAdapterFound,
 }

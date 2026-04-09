@@ -1,8 +1,6 @@
-//! https://github.com/Rubensei/windivert-rust
-//! https://www.reqrypt.org/windivert-doc.html
-//! https://www.reqrypt.org/windivert-doc.html#filter_language
-//!
-//! Missing SYS error? - `sc delete WinDivert`
+//! DecLimiter - Network bandwidth limiter for Windows
+//! Uses Windows Packet Filter (ndisapi) for transparent packet interception.
+//! Requires WinpkFilter driver to be installed: https://www.ntkernel.com/windows-packet-filter/
 
 mod cli;
 mod error;
@@ -18,8 +16,8 @@ async fn main() {
 
     if let Err(e) = handle_startup().await {
         let err_str = e.to_string();
-        if err_str.contains("Running without elevated access rights") {
-            eprintln!("Error: Access denied. Please run DecLimiter as Administrator.");
+        if err_str.contains("elevated") || err_str.contains("Access") || err_str.contains("failed to load") {
+            eprintln!("Error: Access denied or driver not found. Please run DecLimiter as Administrator and ensure WinpkFilter driver is installed.");
         } else {
             eprintln!("Error: {}", err_str);
         }
@@ -37,6 +35,6 @@ fn wait_for_input() {
 #[ignore]
 #[tokio::test]
 async fn test_limiter() {
-    let limiter = declimiter_lib::limiter::DecLimiter::new();
-    tokio::try_join!(limiter.start(), limiter.limit_download_speed_pid(44188, 500), limiter.garbage_collect_flows(std::time::Duration::from_secs(100))).unwrap();
+    let limiter = declimiter_lib::limiter::DecLimiter::new().unwrap();
+    tokio::try_join!(limiter.start(), limiter.limit_speed_pid(44188, Some(500), None), limiter.garbage_collect_flows(std::time::Duration::from_secs(100))).unwrap();
 }

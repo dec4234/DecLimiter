@@ -9,9 +9,7 @@ git clone https://github.com/dec4234/DecLimiter
 cargo build --release
 ```
 
-2. Download the Windivert drivers from https://www.reqrypt.org/windivert.html
-
-3. Set your WINDIVERT_PATH environment variable to the x64/ directory of the downloaded Windivert files.
+2. Install [Windows Packet Filter](https://github.com/wiresock/ndisapi/releases)
 
 ## Usage
 There are 2 provided ways to limit the speed of a process.
