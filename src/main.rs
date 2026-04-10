@@ -14,16 +14,24 @@ async fn main() {
 
     debug!("DecLimiter Starting...");
 
-    if let Err(e) = handle_startup().await {
-        let err_str = e.to_string();
-        if err_str.contains("elevated") || err_str.contains("Access") || err_str.contains("failed to load") {
-            eprintln!("Error: Access denied or driver not found. Please run DecLimiter as Administrator and ensure WinpkFilter driver is installed.");
-        } else {
-            eprintln!("Error: {}", err_str);
+    match handle_startup().await {
+        Ok(true) => {
+            // GUI was launched and closed — exit cleanly
+        }
+        Ok(false) => {
+            // CLI mode — wait for user before closing console
+            wait_for_input();
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("elevated") || err_str.contains("Access") || err_str.contains("failed to load") {
+                eprintln!("Error: Access denied or driver not found. Please run DecLimiter as Administrator and ensure WinpkFilter driver is installed.");
+            } else {
+                eprintln!("Error: {}", err_str);
+            }
+            wait_for_input();
         }
     }
-
-    wait_for_input();
 }
 
 fn wait_for_input() {

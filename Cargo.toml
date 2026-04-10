@@ -13,3 +13,6 @@ declimiter-lib = { path = "src/declimiter-lib"}
 thiserror = "2.0.18"
 futures = { version = "0.3.31", features = []}
 ratatui = "0.30.0"
+eframe = "0.30"
+egui_extras = "0.30"
+windows = { version = "0.62", features = ["Win32_System_Console"] }
