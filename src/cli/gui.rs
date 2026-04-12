@@ -7,6 +7,8 @@ use declimiter_lib::limiter::{DecLimiter, LimitConfig, LimitsMap, ProcessTraffic
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
+use crate::config::{self, ProcessConfig, ProcessesConfig};
+
 const SYSTEM_PID: u32 = 0;
 
 /// Launch the GUI network monitor window.
@@ -63,6 +65,10 @@ pub fn launch_gui() {
 		..Default::default()
 	};
 
+	// Load saved process configs and app config from disk
+	config::load_app_config();
+	let saved_processes = config::load_processes_config();
+
 	eframe::run_native(
 		"DecLimiter",
 		options,
@@ -77,6 +83,8 @@ pub fn launch_gui() {
 				sort_ascending: false,
 				search_query: String::new(),
 				selected_pid: None,
+				saved_processes,
+				known_pids: HashMap::new(),
 			}))
 		}),
 	)
@@ -128,6 +136,25 @@ impl SpeedUnit {
 			Self::KBps => 1_024.0,
 			Self::MBps => 1_048_576.0,
 			Self::GBps => 1_073_741_824.0,
+		}
+	}
+
+	fn as_str(&self) -> &'static str {
+		match self {
+			Self::Bps => "Bps",
+			Self::KBps => "KBps",
+			Self::MBps => "MBps",
+			Self::GBps => "GBps",
+		}
+	}
+
+	fn from_str(s: &str) -> Self {
+		match s {
+			"Bps" => Self::Bps,
+			"KBps" => Self::KBps,
+			"MBps" => Self::MBps,
+			"GBps" => Self::GBps,
+			_ => Self::KBps,
 		}
 	}
 }
@@ -186,6 +213,36 @@ impl ProcessLimitState {
 	fn ul_active(&self) -> bool {
 		self.ul_blocked || (self.ul_enabled && self.ul_value > 0.0)
 	}
+
+	fn to_process_config(&self) -> ProcessConfig {
+		ProcessConfig {
+			dl_enabled: self.dl_enabled,
+			dl_value: self.dl_value,
+			dl_unit: self.dl_unit.as_str().to_string(),
+			dl_blocked: self.dl_blocked,
+			ul_enabled: self.ul_enabled,
+			ul_value: self.ul_value,
+			ul_unit: self.ul_unit.as_str().to_string(),
+			ul_blocked: self.ul_blocked,
+		}
+	}
+
+	fn from_process_config(cfg: &ProcessConfig) -> Self {
+		Self {
+			dl_enabled: cfg.dl_enabled,
+			dl_value: cfg.dl_value,
+			dl_unit: SpeedUnit::from_str(&cfg.dl_unit),
+			dl_blocked: cfg.dl_blocked,
+			ul_enabled: cfg.ul_enabled,
+			ul_value: cfg.ul_value,
+			ul_unit: SpeedUnit::from_str(&cfg.ul_unit),
+			ul_blocked: cfg.ul_blocked,
+		}
+	}
+
+	fn has_any_setting(&self) -> bool {
+		self.dl_enabled || self.dl_blocked || self.ul_enabled || self.ul_blocked
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +258,10 @@ struct DecLimiterApp {
 	sort_ascending: bool,
 	search_query: String,
 	selected_pid: Option<u32>,
+	/// Saved process configs loaded from disk, keyed by process name.
+	saved_processes: ProcessesConfig,
+	/// Tracks which process names we've already restored settings for (by PID).
+	known_pids: HashMap<u32, String>,
 }
 
 impl DecLimiterApp {
@@ -234,6 +295,20 @@ impl DecLimiterApp {
 		}
 	}
 
+	/// Save current limit states to disk, keyed by process name.
+	fn save_to_disk(&mut self) {
+		for (&pid, state) in &self.limit_states {
+			if let Some(name) = self.known_pids.get(&pid) {
+				if state.has_any_setting() {
+					self.saved_processes.insert(name.clone(), state.to_process_config());
+				} else {
+					self.saved_processes.remove(name);
+				}
+			}
+		}
+		config::save_processes_config(&self.saved_processes);
+	}
+
 	/// Build the System aggregate row from all process stats.
 	fn system_row(stats: &[ProcessTraffic]) -> ProcessTraffic {
 		ProcessTraffic {
@@ -265,6 +340,27 @@ impl eframe::App for DecLimiterApp {
 		}
 
 		let mut stats = self.stats.lock().unwrap().clone();
+
+		// Restore saved settings for any newly-seen processes
+		let mut restored_any = false;
+		for proc in &stats {
+			if proc.pid == SYSTEM_PID {
+				continue;
+			}
+			if !self.known_pids.contains_key(&proc.pid) {
+				self.known_pids.insert(proc.pid, proc.name.clone());
+				if let Some(saved) = self.saved_processes.get(&proc.name) {
+					let state = ProcessLimitState::from_process_config(saved);
+					if state.has_any_setting() {
+						self.limit_states.insert(proc.pid, state);
+						restored_any = true;
+					}
+				}
+			}
+		}
+		if restored_any {
+			self.apply_limits();
+		}
 
 		// Filter by search query
 		if !self.search_query.is_empty() {
@@ -549,6 +645,7 @@ impl eframe::App for DecLimiterApp {
 
 		if limits_changed {
 			self.apply_limits();
+			self.save_to_disk();
 		}
 	}
 }

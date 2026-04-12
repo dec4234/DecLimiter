@@ -17,6 +17,9 @@ eframe = "0.30"
 egui_extras = "0.30"
 windows = { version = "0.62", features = ["Win32_System_Console"] }
 image = "0.25.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
 
 [build-dependencies]
 winresource = "0.1.31"

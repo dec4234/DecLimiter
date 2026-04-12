@@ -4,6 +4,7 @@
 
 mod cli;
 mod error;
+pub mod config;
 
 use log::{debug, Level};
 use crate::cli::{handle_startup};
