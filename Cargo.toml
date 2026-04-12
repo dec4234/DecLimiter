@@ -16,3 +16,7 @@ ratatui = "0.30.0"
 eframe = "0.30"
 egui_extras = "0.30"
 windows = { version = "0.62", features = ["Win32_System_Console"] }
+image = "0.25.10"
+
+[build-dependencies]
+winresource = "0.1.31"

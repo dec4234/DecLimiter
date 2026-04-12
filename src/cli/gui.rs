@@ -48,8 +48,18 @@ pub fn launch_gui() {
 		});
 	});
 
+	let icon = {
+		let icon_bytes = include_bytes!("../../assets/icon.png");
+		let img = image::load_from_memory(icon_bytes).expect("Failed to load icon").into_rgba8();
+		let (w, h) = img.dimensions();
+		egui::IconData { rgba: img.into_raw(), width: w, height: h }
+	};
+
 	let options = eframe::NativeOptions {
-		viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]).with_title("DecLimiter"),
+		viewport: egui::ViewportBuilder::default()
+			.with_inner_size([900.0, 600.0])
+			.with_title("DecLimiter")
+			.with_icon(Arc::new(icon)),
 		..Default::default()
 	};
 

@@ -219,32 +219,6 @@ impl DecLimiter {
 								flow_map.blocking_lock().get(&f).map(|e| e.pid)
 							});
 
-							// Count bytes for known PIDs
-							if let Some(pid) = pid {
-								if let Ok(mut traffic_lock) = traffic.write() {
-									let inner = traffic_lock.entry(pid).or_insert_with(|| {
-										let name = get_process_name(pid).unwrap_or_else(|| format!("PID {}", pid));
-										ProcessTrafficInner {
-											name,
-											download_bytes: 0,
-											upload_bytes: 0,
-											prev_download_bytes: 0,
-											prev_upload_bytes: 0,
-											download_speed: 0.0,
-											upload_speed: 0.0,
-											last_seen: Instant::now(),
-										}
-									});
-
-									if is_outbound {
-										inner.upload_bytes += packet_len as u64;
-									} else {
-										inner.download_bytes += packet_len as u64;
-									}
-									inner.last_seen = Instant::now();
-								}
-							}
-
 							// Apply limits: system-wide (PID 0) first, then per-PID
 							if let Ok(limits_lock) = limits.read() {
 								// System-wide limit
@@ -282,6 +256,36 @@ impl DecLimiter {
 												None => {}
 											}
 										}
+									}
+								}
+							}
+
+							// Count bytes for known PIDs only if the packet is not dropped.
+							// Skip PID 0 (System Process) — its traffic is covered by the
+							// GUI's synthetic System row which aggregates all processes.
+							if !should_drop {
+								if let Some(pid) = pid.filter(|&p| p != 0) {
+									if let Ok(mut traffic_lock) = traffic.write() {
+										let inner = traffic_lock.entry(pid).or_insert_with(|| {
+											let name = get_process_name(pid).unwrap_or_else(|| format!("PID {}", pid));
+											ProcessTrafficInner {
+												name,
+												download_bytes: 0,
+												upload_bytes: 0,
+												prev_download_bytes: 0,
+												prev_upload_bytes: 0,
+												download_speed: 0.0,
+												upload_speed: 0.0,
+												last_seen: Instant::now(),
+											}
+										});
+
+										if is_outbound {
+											inner.upload_bytes += packet_len as u64;
+										} else {
+											inner.download_bytes += packet_len as u64;
+										}
+										inner.last_seen = Instant::now();
 									}
 								}
 							}
