@@ -57,6 +57,17 @@ struct ProcessTrafficInner {
 	last_seen: Instant,
 }
 
+/// Aggregate byte counters for all traffic passing through the monitor,
+/// regardless of whether PID attribution succeeded.
+struct TotalTrafficCounters {
+	download_bytes: u64,
+	upload_bytes: u64,
+	prev_download_bytes: u64,
+	prev_upload_bytes: u64,
+	download_speed: f64,
+	upload_speed: f64,
+}
+
 /// Per-PID throttle state kept locally in the packet processing thread.
 struct ThrottleState {
 	dl_window: VecDeque<(Instant, usize)>,
@@ -80,6 +91,7 @@ impl ThrottleState {
 pub struct DecLimiter {
 	map: Arc<Mutex<HashMap<FlowAddress, FlowEntry>>>,
 	traffic: Arc<std::sync::RwLock<HashMap<u32, ProcessTrafficInner>>>,
+	totals: Arc<std::sync::RwLock<TotalTrafficCounters>>,
 	limits: LimitsMap,
 }
 
@@ -102,6 +114,14 @@ impl DecLimiter {
 		Ok(Self {
 			map: Arc::new(Mutex::new(HashMap::new())),
 			traffic: Arc::new(std::sync::RwLock::new(HashMap::new())),
+			totals: Arc::new(std::sync::RwLock::new(TotalTrafficCounters {
+				download_bytes: 0,
+				upload_bytes: 0,
+				prev_download_bytes: 0,
+				prev_upload_bytes: 0,
+				download_speed: 0.0,
+				upload_speed: 0.0,
+			})),
 			limits: Arc::new(std::sync::RwLock::new(HashMap::new())),
 		})
 	}
@@ -190,6 +210,7 @@ impl DecLimiter {
 	pub fn start_monitor(&self) -> JoinHandle<Result<(), DecLimiterError>> {
 		let flow_map = self.map.clone();
 		let traffic = self.traffic.clone();
+		let totals = self.totals.clone();
 		let limits = self.limits.clone();
 
 		tokio::task::spawn_blocking(move || {
@@ -260,33 +281,44 @@ impl DecLimiter {
 								}
 							}
 
-							// Count bytes for known PIDs only if the packet is not dropped.
-							// Skip PID 0 (System Process) — its traffic is covered by the
-							// GUI's synthetic System row which aggregates all processes.
+							// Count ALL bytes toward totals (regardless of PID attribution)
 							if !should_drop {
-								if let Some(pid) = pid.filter(|&p| p != 0) {
-									if let Ok(mut traffic_lock) = traffic.write() {
-										let inner = traffic_lock.entry(pid).or_insert_with(|| {
-											let name = get_process_name(pid).unwrap_or_else(|| format!("PID {}", pid));
-											ProcessTrafficInner {
-												name,
-												download_bytes: 0,
-												upload_bytes: 0,
-												prev_download_bytes: 0,
-												prev_upload_bytes: 0,
-												download_speed: 0.0,
-												upload_speed: 0.0,
-												last_seen: Instant::now(),
-											}
-										});
+								if let Ok(mut t) = totals.write() {
+									if is_outbound {
+										t.upload_bytes += packet_len as u64;
+									} else {
+										t.download_bytes += packet_len as u64;
+									}
+								}
+							}
 
+							// Track per-PID traffic (skip PID 0 — covered by totals).
+							// Always update last_seen so blocked processes remain
+							// visible in the list, giving the user a way to unblock them.
+							if let Some(pid) = pid.filter(|&p| p != 0) {
+								if let Ok(mut traffic_lock) = traffic.write() {
+									let inner = traffic_lock.entry(pid).or_insert_with(|| {
+										let name = get_process_name(pid).unwrap_or_else(|| format!("PID {}", pid));
+										ProcessTrafficInner {
+											name,
+											download_bytes: 0,
+											upload_bytes: 0,
+											prev_download_bytes: 0,
+											prev_upload_bytes: 0,
+											download_speed: 0.0,
+											upload_speed: 0.0,
+											last_seen: Instant::now(),
+										}
+									});
+
+									if !should_drop {
 										if is_outbound {
 											inner.upload_bytes += packet_len as u64;
 										} else {
 											inner.download_bytes += packet_len as u64;
 										}
-										inner.last_seen = Instant::now();
 									}
+									inner.last_seen = Instant::now();
 								}
 							}
 						}
@@ -310,6 +342,7 @@ impl DecLimiter {
 	/// from both the traffic and flow maps.
 	pub fn start_speed_calculator(&self) -> JoinHandle<()> {
 		let traffic = self.traffic.clone();
+		let totals = self.totals.clone();
 		let flow_map = self.map.clone();
 
 		tokio::spawn(async move {
@@ -326,6 +359,13 @@ impl DecLimiter {
 						inner.prev_upload_bytes = inner.upload_bytes;
 						now.duration_since(inner.last_seen) < STALE_ENTRY_TIMEOUT
 					});
+				}
+
+				if let Ok(mut t) = totals.write() {
+					t.download_speed = (t.download_bytes - t.prev_download_bytes) as f64;
+					t.upload_speed = (t.upload_bytes - t.prev_upload_bytes) as f64;
+					t.prev_download_bytes = t.download_bytes;
+					t.prev_upload_bytes = t.upload_bytes;
 				}
 
 				{
@@ -353,6 +393,19 @@ impl DecLimiter {
 			.collect();
 		stats.sort_by(|a, b| b.download_speed.partial_cmp(&a.download_speed).unwrap_or(std::cmp::Ordering::Equal));
 		stats
+	}
+
+	/// Get the total traffic counters (all traffic, including unattributed).
+	pub fn get_totals(&self) -> ProcessTraffic {
+		let t = self.totals.read().unwrap();
+		ProcessTraffic {
+			pid: 0,
+			name: "System".to_string(),
+			download_bytes: t.download_bytes,
+			upload_bytes: t.upload_bytes,
+			download_speed: t.download_speed,
+			upload_speed: t.upload_speed,
+		}
 	}
 
 	/// Periodically removes stale flow entries that have not been seen within the specified maximum age.

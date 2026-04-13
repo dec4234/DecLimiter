@@ -16,10 +16,14 @@ pub fn launch_gui() {
 	simple_logger::init_with_level(log::Level::Debug).ok();
 
 	let stats: Arc<Mutex<Vec<ProcessTraffic>>> = Arc::new(Mutex::new(Vec::new()));
+	let system_totals: Arc<Mutex<ProcessTraffic>> = Arc::new(Mutex::new(ProcessTraffic {
+		pid: 0, name: "System".to_string(), download_bytes: 0, upload_bytes: 0, download_speed: 0.0, upload_speed: 0.0,
+	}));
 	let monitor_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 	let limits: Arc<Mutex<Option<LimitsMap>>> = Arc::new(Mutex::new(None));
 
 	let stats_bg = stats.clone();
+	let totals_bg = system_totals.clone();
 	let error_bg = monitor_error.clone();
 	let limits_bg = limits.clone();
 	thread::spawn(move || {
@@ -44,7 +48,9 @@ pub fn launch_gui() {
 
 			loop {
 				let snapshot = limiter.get_snapshot();
+				let totals = limiter.get_totals();
 				*stats_bg.lock().unwrap() = snapshot;
+				*totals_bg.lock().unwrap() = totals;
 				tokio::time::sleep(Duration::from_millis(500)).await;
 			}
 		});
@@ -76,6 +82,7 @@ pub fn launch_gui() {
 			configure_style(&cc.egui_ctx);
 			Ok(Box::new(DecLimiterApp {
 				stats,
+				system_totals,
 				monitor_error,
 				limits_handle: limits,
 				limit_states: HashMap::new(),
@@ -251,6 +258,7 @@ impl ProcessLimitState {
 
 struct DecLimiterApp {
 	stats: Arc<Mutex<Vec<ProcessTraffic>>>,
+	system_totals: Arc<Mutex<ProcessTraffic>>,
 	monitor_error: Arc<Mutex<Option<String>>>,
 	limits_handle: Arc<Mutex<Option<LimitsMap>>>,
 	limit_states: HashMap<u32, ProcessLimitState>,
@@ -309,17 +317,6 @@ impl DecLimiterApp {
 		config::save_processes_config(&self.saved_processes);
 	}
 
-	/// Build the System aggregate row from all process stats.
-	fn system_row(stats: &[ProcessTraffic]) -> ProcessTraffic {
-		ProcessTraffic {
-			pid: SYSTEM_PID,
-			name: "System".to_string(),
-			download_bytes: stats.iter().map(|s| s.download_bytes).sum(),
-			upload_bytes: stats.iter().map(|s| s.upload_bytes).sum(),
-			download_speed: stats.iter().map(|s| s.download_speed).sum(),
-			upload_speed: stats.iter().map(|s| s.upload_speed).sum(),
-		}
-	}
 }
 
 impl eframe::App for DecLimiterApp {
@@ -368,8 +365,8 @@ impl eframe::App for DecLimiterApp {
 			stats.retain(|s| s.name.to_lowercase().contains(&query) || s.pid.to_string().contains(&query));
 		}
 
-		// Build System row from totals, then sort the per-process rows
-		let system_row = Self::system_row(&stats);
+		// Use real total traffic counters for the System row
+		let system_row = self.system_totals.lock().unwrap().clone();
 		self.sort_stats(&mut stats);
 
 		// Combine: System always first

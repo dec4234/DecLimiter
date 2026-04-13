@@ -1,7 +1,3 @@
--- DecLimiter SQLite Schema
--- Database located at: %APPDATA%/DecLimiter/declimiter.db (Windows)
---                       ~/.config/DecLimiter/declimiter.db  (Linux/macOS)
-
 -- Key-value store for application-wide settings.
 CREATE TABLE IF NOT EXISTS app_config (
     key   TEXT PRIMARY KEY,
@@ -21,7 +17,6 @@ CREATE TABLE IF NOT EXISTS process_config (
     ul_blocked   INTEGER NOT NULL DEFAULT 0
 );
 
--- Indexes
 CREATE INDEX IF NOT EXISTS idx_process_config_dl_enabled
     ON process_config (dl_enabled);
 
