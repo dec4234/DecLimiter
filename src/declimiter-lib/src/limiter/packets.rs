@@ -26,7 +26,9 @@ pub fn reinject_packet(driver: &Ndisapi, adapter_handle: HANDLE, packet: &Interm
 }
 
 /// Apply throttling by tracking a moving average window and sleeping to limit throughput.
-pub fn throttle_packet(window: &mut VecDeque<(Instant, usize)>, dynamic_delay_us: &mut i64, max_delay_us: i64, target_byterate: u64, bytes: usize) {
+/// Uses a PI controller (proportional + integral) to converge on the target rate
+/// without steady-state overshoot.
+pub fn throttle_packet(window: &mut VecDeque<(Instant, usize)>, dynamic_delay_us: &mut i64, integral_error: &mut f64, max_delay_us: i64, target_byterate: u64, bytes: usize) {
     let now = Instant::now();
 
     window.push_back((now, bytes));
@@ -44,9 +46,19 @@ pub fn throttle_packet(window: &mut VecDeque<(Instant, usize)>, dynamic_delay_us
             let actual_rate = total_bytes as f64 / duration;
             let error = actual_rate - target_byterate as f64;
 
-            let kp = 0.02;
-            *dynamic_delay_us += (error * kp) as i64;
-            *dynamic_delay_us = (*dynamic_delay_us).clamp(0, max_delay_us);
+            // PI controller: delay is SET (not accumulated) from the PI output.
+            // P term: immediate response proportional to current error
+            // I term: integral_error accumulates over time to eliminate steady-state offset
+            let kp = 0.00003;
+            let ki = 0.00001;
+
+            *integral_error += error * duration;
+            // Anti-windup: clamp integral so its contribution stays within max delay
+            let max_integral = max_delay_us as f64 / ki;
+            *integral_error = integral_error.clamp(0.0, max_integral);
+
+            let new_delay = (error * kp + *integral_error * ki) as i64;
+            *dynamic_delay_us = new_delay.clamp(0, max_delay_us);
 
             if *dynamic_delay_us > 0 {
                 thread::sleep(Duration::from_micros(*dynamic_delay_us as u64));

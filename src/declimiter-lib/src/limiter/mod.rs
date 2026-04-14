@@ -19,7 +19,7 @@ pub type ProcessPair = (u32, String);
 
 const MOV_AVG_WINDOW_SIZE: usize = 500;
 const ETHERNET_HEADER_LEN: usize = 14;
-const MAX_DELAY_US: i64 = 10_000;
+const MAX_DELAY_US: i64 = 50_000;
 const SPEED_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const STALE_ENTRY_TIMEOUT: Duration = Duration::from_secs(30);
 const STALE_FLOW_TIMEOUT: Duration = Duration::from_secs(120);
@@ -74,6 +74,8 @@ struct ThrottleState {
 	ul_window: VecDeque<(Instant, usize)>,
 	dl_delay_us: i64,
 	ul_delay_us: i64,
+	dl_integral: f64,
+	ul_integral: f64,
 }
 
 impl ThrottleState {
@@ -83,6 +85,8 @@ impl ThrottleState {
 			ul_window: VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE),
 			dl_delay_us: 0,
 			ul_delay_us: 0,
+			dl_integral: 0.0,
+			ul_integral: 0.0,
 		}
 	}
 }
@@ -161,7 +165,7 @@ impl DecLimiter {
 					}
 				}
 
-				sleep(Duration::from_secs(2)).await;
+				sleep(Duration::from_millis(500)).await;
 			}
 		})
 	}
@@ -182,6 +186,8 @@ impl DecLimiter {
 			let mut ul_window: VecDeque<(Instant, usize)> = VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE);
 			let mut dl_delay_us: i64 = 0;
 			let mut ul_delay_us: i64 = 0;
+			let mut dl_integral: f64 = 0.0;
+			let mut ul_integral: f64 = 0.0;
 
 			loop {
 				adapter_management::wait_for_any_event(&events);
@@ -193,6 +199,7 @@ impl DecLimiter {
 						download_byterate, upload_byterate,
 						&mut dl_window, &mut ul_window,
 						&mut dl_delay_us, &mut ul_delay_us,
+						&mut dl_integral, &mut ul_integral,
 						MAX_DELAY_US,
 					);
 				}
@@ -250,9 +257,9 @@ impl DecLimiter {
 										Some(rate) => {
 											let ts = throttle_states.entry(0).or_insert_with(ThrottleState::new);
 											if is_outbound {
-												throttle_packet(&mut ts.ul_window, &mut ts.ul_delay_us, MAX_DELAY_US, rate, packet_len);
+												throttle_packet(&mut ts.ul_window, &mut ts.ul_delay_us, &mut ts.ul_integral, MAX_DELAY_US, rate, packet_len);
 											} else {
-												throttle_packet(&mut ts.dl_window, &mut ts.dl_delay_us, MAX_DELAY_US, rate, packet_len);
+												throttle_packet(&mut ts.dl_window, &mut ts.dl_delay_us, &mut ts.dl_integral, MAX_DELAY_US, rate, packet_len);
 											}
 										}
 										None => {}
@@ -269,9 +276,9 @@ impl DecLimiter {
 												Some(rate) => {
 													let ts = throttle_states.entry(pid).or_insert_with(ThrottleState::new);
 													if is_outbound {
-														throttle_packet(&mut ts.ul_window, &mut ts.ul_delay_us, MAX_DELAY_US, rate, packet_len);
+														throttle_packet(&mut ts.ul_window, &mut ts.ul_delay_us, &mut ts.ul_integral, MAX_DELAY_US, rate, packet_len);
 													} else {
-														throttle_packet(&mut ts.dl_window, &mut ts.dl_delay_us, MAX_DELAY_US, rate, packet_len);
+														throttle_packet(&mut ts.dl_window, &mut ts.dl_delay_us, &mut ts.dl_integral, MAX_DELAY_US, rate, packet_len);
 													}
 												}
 												None => {}

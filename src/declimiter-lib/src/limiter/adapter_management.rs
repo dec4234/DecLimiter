@@ -51,6 +51,8 @@ pub fn process_adapter_packets(
 	ul_window: &mut VecDeque<(Instant, usize)>,
 	dl_delay_us: &mut i64,
 	ul_delay_us: &mut i64,
+	dl_integral: &mut f64,
+	ul_integral: &mut f64,
 	max_delay_us: i64,
 ) {
 	while read_packet(driver, adapter_handle, packet) {
@@ -70,10 +72,10 @@ pub fn process_adapter_packets(
 				if DecLimiter::pid_matches_blocking(map, &flow, pid) {
 					if is_outbound {
 						if let Some(rate) = upload_byterate {
-							throttle_packet(ul_window, ul_delay_us, max_delay_us, rate, ip_data.len());
+							throttle_packet(ul_window, ul_delay_us, ul_integral, max_delay_us, rate, ip_data.len());
 						}
 					} else if let Some(rate) = download_byterate {
-						throttle_packet(dl_window, dl_delay_us, max_delay_us, rate, ip_data.len());
+						throttle_packet(dl_window, dl_delay_us, dl_integral, max_delay_us, rate, ip_data.len());
 					}
 				}
 			}
