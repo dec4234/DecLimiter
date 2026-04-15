@@ -1,10 +1,6 @@
 use ndisapi::{EthRequest, EthRequestMut, IntermediateBuffer, Ndisapi};
-use std::collections::VecDeque;
-use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HANDLE;
-
-use super::MOV_AVG_WINDOW_SIZE;
 
 /// Read a single packet from the adapter. Returns true if a packet was read.
 pub fn read_packet(driver: &Ndisapi, adapter_handle: HANDLE, packet: &mut IntermediateBuffer) -> bool {
@@ -25,44 +21,59 @@ pub fn reinject_packet(driver: &Ndisapi, adapter_handle: HANDLE, packet: &Interm
     }
 }
 
-/// Apply throttling by tracking a moving average window and sleeping to limit throughput.
-/// Uses a PI controller (proportional + integral) to converge on the target rate
-/// without steady-state overshoot.
-pub fn throttle_packet(window: &mut VecDeque<(Instant, usize)>, dynamic_delay_us: &mut i64, integral_error: &mut f64, max_delay_us: i64, target_byterate: u64, bytes: usize) {
-    let now = Instant::now();
+/// Token-bucket rate limiter for a single direction (download or upload).
+///
+/// Tokens represent bytes. The bucket refills at `rate` bytes/sec up to
+/// `capacity`. When a packet arrives, its size is deducted from the bucket.
+/// If the bucket goes negative, the packet must be delayed until enough
+/// tokens have accumulated — the returned `Duration` tells the caller how
+/// long to defer reinjection.
+pub struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    rate: f64,
+    last_refill: Instant,
+}
 
-    window.push_back((now, bytes));
-    if window.len() > MOV_AVG_WINDOW_SIZE {
-        window.pop_front();
+impl TokenBucket {
+    pub fn new(rate: u64) -> Self {
+        let rate_f = rate as f64;
+        // Allow ~50ms of burst.  Enough to absorb normal jitter without
+        // letting large bursts blow past the limit.
+        let capacity = (rate_f * 0.05).max(1500.0);
+        Self {
+            tokens: capacity,
+            capacity,
+            rate: rate_f,
+            last_refill: Instant::now(),
+        }
     }
 
-    if window.len() > 1 {
-        let first = window.front().unwrap().0;
-        let last = window.back().unwrap().0;
+    /// Consume `bytes` from the bucket, returning the delay before the packet
+    /// should be reinjected.  Returns `Duration::ZERO` when tokens are
+    /// available (no throttling needed).
+    pub fn consume(&mut self, bytes: usize) -> Duration {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+        self.last_refill = now;
 
-        let duration = last.duration_since(first).as_secs_f64();
-        if duration > 0.0 {
-            let total_bytes: usize = window.iter().map(|(_, b)| *b).sum();
-            let actual_rate = total_bytes as f64 / duration;
-            let error = actual_rate - target_byterate as f64;
+        self.tokens -= bytes as f64;
 
-            // PI controller: delay is SET (not accumulated) from the PI output.
-            // P term: immediate response proportional to current error
-            // I term: integral_error accumulates over time to eliminate steady-state offset
-            let kp = 0.00003;
-            let ki = 0.00001;
-
-            *integral_error += error * duration;
-            // Anti-windup: clamp integral so its contribution stays within max delay
-            let max_integral = max_delay_us as f64 / ki;
-            *integral_error = integral_error.clamp(0.0, max_integral);
-
-            let new_delay = (error * kp + *integral_error * ki) as i64;
-            *dynamic_delay_us = new_delay.clamp(0, max_delay_us);
-
-            if *dynamic_delay_us > 0 {
-                thread::sleep(Duration::from_micros(*dynamic_delay_us as u64));
-            }
+        if self.tokens >= 0.0 {
+            Duration::ZERO
+        } else {
+            // Time until the bucket refills back to zero.
+            Duration::from_secs_f64((-self.tokens) / self.rate)
         }
+    }
+
+    /// Update the target rate.  Keeps current token level (clamped to the new
+    /// capacity) so the transition is smooth.
+    pub fn set_rate(&mut self, rate: u64) {
+        let rate_f = rate as f64;
+        self.rate = rate_f;
+        self.capacity = (rate_f * 0.05).max(1500.0);
+        self.tokens = self.tokens.min(self.capacity);
     }
 }

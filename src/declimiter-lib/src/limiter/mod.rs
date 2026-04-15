@@ -1,25 +1,24 @@
+pub mod adapter_management;
 pub mod network;
 pub mod packets;
-pub mod adapter_management;
 
 use crate::error::DecLimiterError;
 use crate::limiter::network::{FlowAddress, FlowEntry, parse_flow_dest, parse_flow_source};
-use crate::limiter::packets::{read_packet, reinject_packet, throttle_packet};
+use crate::limiter::packets::{TokenBucket, read_packet, reinject_packet};
 use crate::util::get_process_name;
 use log::{debug, error, trace};
 use ndisapi::{DirectionFlags, IntermediateBuffer, Ndisapi};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 pub type ProcessPair = (u32, String);
 
-const MOV_AVG_WINDOW_SIZE: usize = 500;
 const ETHERNET_HEADER_LEN: usize = 14;
-const MAX_DELAY_US: i64 = 50_000;
 const SPEED_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const STALE_ENTRY_TIMEOUT: Duration = Duration::from_secs(30);
 const STALE_FLOW_TIMEOUT: Duration = Duration::from_secs(120);
@@ -69,31 +68,31 @@ struct TotalTrafficCounters {
 }
 
 /// Per-PID throttle state kept locally in the packet processing thread.
+/// Uses token buckets to calculate reinjection delays without blocking.
 struct ThrottleState {
-	dl_window: VecDeque<(Instant, usize)>,
-	ul_window: VecDeque<(Instant, usize)>,
-	dl_delay_us: i64,
-	ul_delay_us: i64,
-	dl_integral: f64,
-	ul_integral: f64,
+	dl_bucket: Option<TokenBucket>,
+	ul_bucket: Option<TokenBucket>,
 }
 
 impl ThrottleState {
 	fn new() -> Self {
-		Self {
-			dl_window: VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE),
-			ul_window: VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE),
-			dl_delay_us: 0,
-			ul_delay_us: 0,
-			dl_integral: 0.0,
-			ul_integral: 0.0,
-		}
+		Self { dl_bucket: None, ul_bucket: None }
+	}
+
+	/// Get or create the download bucket, updating the rate if it changed.
+	fn dl(&mut self, rate: u64) -> &mut TokenBucket {
+		self.dl_bucket.get_or_insert_with(|| TokenBucket::new(rate))
+	}
+
+	/// Get or create the upload bucket, updating the rate if it changed.
+	fn ul(&mut self, rate: u64) -> &mut TokenBucket {
+		self.ul_bucket.get_or_insert_with(|| TokenBucket::new(rate))
 	}
 }
 
 #[derive(Clone)]
 pub struct DecLimiter {
-	map: Arc<Mutex<HashMap<FlowAddress, FlowEntry>>>,
+	map: Arc<RwLock<HashMap<FlowAddress, FlowEntry>>>,
 	traffic: Arc<std::sync::RwLock<HashMap<u32, ProcessTrafficInner>>>,
 	totals: Arc<std::sync::RwLock<TotalTrafficCounters>>,
 	limits: LimitsMap,
@@ -116,7 +115,7 @@ impl DecLimiter {
 		}
 
 		Ok(Self {
-			map: Arc::new(Mutex::new(HashMap::new())),
+			map: Arc::new(RwLock::new(HashMap::new())),
 			traffic: Arc::new(std::sync::RwLock::new(HashMap::new())),
 			totals: Arc::new(std::sync::RwLock::new(TotalTrafficCounters {
 				download_bytes: 0,
@@ -136,9 +135,57 @@ impl DecLimiter {
 	}
 
 	/// Check if the given PID matches the PID associated with the given flow address.
-	fn pid_matches_blocking(map: &Arc<Mutex<HashMap<FlowAddress, FlowEntry>>>, flow: &FlowAddress, pid: u32) -> bool {
-		let map_lock = map.blocking_lock();
-		map_lock.get(flow).map_or(false, |entry| entry.pid == pid)
+	fn pid_matches_blocking(map: &Arc<RwLock<HashMap<FlowAddress, FlowEntry>>>, flow: &FlowAddress, pid: u32) -> bool {
+		let map_lock = map.blocking_read();
+		if let Some(entry) = map_lock.get(flow) {
+			return entry.pid == pid;
+		}
+		// Fallback: UDP sockets bound to INADDR_ANY (0.0.0.0 / ::) appear in
+		// the connection table with a wildcard IP, but inbound packets carry the
+		// machine's specific IP.  Try matching by port alone against those entries.
+		let unspec = match flow.ip {
+			IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+			IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+		};
+		let wildcard = FlowAddress::new(unspec, flow.port);
+		map_lock.get(&wildcard).map_or(false, |entry| entry.pid == pid)
+	}
+
+	/// Record bytes in the total and per-PID traffic counters.
+	/// Called at *reinjection* time so the speed display reflects actual
+	/// delivered throughput, not intercepted-but-queued traffic.
+	fn count_traffic(totals: &Arc<std::sync::RwLock<TotalTrafficCounters>>, traffic: &Arc<std::sync::RwLock<HashMap<u32, ProcessTrafficInner>>>, pid: Option<u32>, is_outbound: bool, frame_len: usize) {
+		if let Ok(mut t) = totals.write() {
+			if is_outbound {
+				t.upload_bytes += frame_len as u64;
+			} else {
+				t.download_bytes += frame_len as u64;
+			}
+		}
+
+		if let Some(pid) = pid.filter(|&p| p != 0) {
+			if let Ok(mut traffic_lock) = traffic.write() {
+				let inner = traffic_lock.entry(pid).or_insert_with(|| {
+					let name = get_process_name(pid).unwrap_or_else(|| format!("PID {}", pid));
+					ProcessTrafficInner {
+						name,
+						download_bytes: 0,
+						upload_bytes: 0,
+						prev_download_bytes: 0,
+						prev_upload_bytes: 0,
+						download_speed: 0.0,
+						upload_speed: 0.0,
+						last_seen: Instant::now(),
+					}
+				});
+				if is_outbound {
+					inner.upload_bytes += frame_len as u64;
+				} else {
+					inner.download_bytes += frame_len as u64;
+				}
+				inner.last_seen = Instant::now();
+			}
+		}
 	}
 
 	/// Polls the Windows TCP/UDP connection tables to build PID-to-port mappings.
@@ -152,7 +199,7 @@ impl DecLimiter {
 				let mappings = network::get_pid_port_mappings();
 
 				{
-					let mut map_lock = map.lock().await;
+					let mut map_lock = map.write().await;
 					for (ip, port, pid) in mappings {
 						let flow = FlowAddress::new(ip, port);
 						map_lock
@@ -165,13 +212,15 @@ impl DecLimiter {
 					}
 				}
 
-				sleep(Duration::from_millis(500)).await;
+				sleep(Duration::from_millis(100)).await;
 			}
 		})
 	}
 
 	/// Limit network speed for a specific process via its PID.
 	/// Intercepts packets on ALL adapters to match WinDivert's behavior.
+	/// Throttled packets are deferred into a delay queue so non-target traffic
+	/// is never blocked.
 	pub fn limit_speed_pid(&self, pid: u32, download_byterate: Option<u64>, upload_byterate: Option<u64>) -> JoinHandle<Result<(), DecLimiterError>> {
 		let map = self.map.clone();
 
@@ -182,26 +231,21 @@ impl DecLimiter {
 			let (adapter_handles, events) = adapter_management::setup_adapters(&driver)?;
 
 			let mut packet = IntermediateBuffer::default();
-			let mut dl_window: VecDeque<(Instant, usize)> = VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE);
-			let mut ul_window: VecDeque<(Instant, usize)> = VecDeque::with_capacity(MOV_AVG_WINDOW_SIZE);
-			let mut dl_delay_us: i64 = 0;
-			let mut ul_delay_us: i64 = 0;
-			let mut dl_integral: f64 = 0.0;
-			let mut ul_integral: f64 = 0.0;
+			let mut dl_bucket: Option<TokenBucket> = download_byterate.map(TokenBucket::new);
+			let mut ul_bucket: Option<TokenBucket> = upload_byterate.map(TokenBucket::new);
+			let mut delay_queue: std::collections::VecDeque<adapter_management::DelayedPacket> = std::collections::VecDeque::new();
+			let mut reinjected: Vec<adapter_management::ReinjectedInfo> = Vec::new();
 
 			loop {
-				adapter_management::wait_for_any_event(&events);
+				let timeout = if delay_queue.is_empty() { u32::MAX } else { 1 };
+				adapter_management::wait_for_any_event_timeout(&events, timeout);
+
+				// Flush delayed packets that are now ready.
+				reinjected.clear();
+				adapter_management::flush_delayed(&driver, &mut delay_queue, &mut reinjected);
 
 				for (adapter_idx, &adapter_handle) in adapter_handles.iter().enumerate() {
-					adapter_management::process_adapter_packets(
-						&driver, adapter_handle, adapter_idx,
-						&mut packet, &map, pid,
-						download_byterate, upload_byterate,
-						&mut dl_window, &mut ul_window,
-						&mut dl_delay_us, &mut ul_delay_us,
-						&mut dl_integral, &mut ul_integral,
-						MAX_DELAY_US,
-					);
+					adapter_management::process_adapter_packets(&driver, adapter_handle, adapter_idx, &mut packet, &map, pid, &mut dl_bucket, &mut ul_bucket, &mut delay_queue);
 				}
 
 				for &event in &events {
@@ -214,6 +258,9 @@ impl DecLimiter {
 	/// Intercept packets on all adapters, count bytes per process, and apply
 	/// speed limits from the shared limits map. Supports per-PID limits,
 	/// system-wide limits (PID 0), and blocking (byterate 0 = drop packet).
+	///
+	/// Throttled packets are deferred into a local delay queue and reinjected
+	/// once their release time arrives, so non-limited traffic is never blocked.
 	pub fn start_monitor(&self) -> JoinHandle<Result<(), DecLimiterError>> {
 		let flow_map = self.map.clone();
 		let traffic = self.traffic.clone();
@@ -227,25 +274,54 @@ impl DecLimiter {
 
 			let mut packet = IntermediateBuffer::default();
 			let mut throttle_states: HashMap<u32, ThrottleState> = HashMap::new();
+			let mut delay_queue: std::collections::VecDeque<adapter_management::DelayedPacket> = std::collections::VecDeque::new();
+			let mut reinjected: Vec<adapter_management::ReinjectedInfo> = Vec::new();
 
 			loop {
-				adapter_management::wait_for_any_event(&events);
+				// If delayed packets are pending, use a short timeout so we can
+				// flush them promptly. Otherwise block until new traffic arrives.
+				let timeout = if delay_queue.is_empty() { u32::MAX } else { 1 };
+				adapter_management::wait_for_any_event_timeout(&events, timeout);
+
+				// Flush any delayed packets that are now ready for reinjection.
+				// Count their traffic now (at delivery time).
+				reinjected.clear();
+				adapter_management::flush_delayed(&driver, &mut delay_queue, &mut reinjected);
+				for info in &reinjected {
+					Self::count_traffic(&totals, &traffic, info.pid, info.is_outbound, info.frame_len);
+				}
 
 				for (idx, &handle) in adapter_handles.iter().enumerate() {
 					while read_packet(&driver, handle, &mut packet) {
 						let is_outbound = packet.get_device_flags() == DirectionFlags::PACKET_FLAG_ON_SEND;
 						let data = packet.get_data();
 						let mut should_drop = false;
+						let mut delay = Duration::ZERO;
+						// Resolved PID for this packet (used for traffic counting
+						// and per-PID limiting).
+						let mut resolved_pid: Option<u32> = None;
 
 						if data.len() > ETHERNET_HEADER_LEN {
 							let ip_data = &data[ETHERNET_HEADER_LEN..];
-							let packet_len = ip_data.len();
+							// Use the full frame length for the token bucket so the
+							// rate limit reflects actual wire throughput.
+							let frame_len = data.len();
 
 							let flow = if is_outbound { parse_flow_source(ip_data) } else { parse_flow_dest(ip_data) };
 
 							let pid = flow.and_then(|f| {
-								flow_map.blocking_lock().get(&f).map(|e| e.pid)
+								let map = flow_map.blocking_read();
+								map.get(&f).map(|e| e.pid).or_else(|| {
+									// Fallback for sockets bound to INADDR_ANY / IN6ADDR_ANY.
+									let unspec = match f.ip {
+										IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+										IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+									};
+									let wildcard = FlowAddress::new(unspec, f.port);
+									map.get(&wildcard).map(|e| e.pid)
+								})
 							});
+							resolved_pid = pid;
 
 							// Apply limits: system-wide (PID 0) first, then per-PID
 							if let Ok(limits_lock) = limits.read() {
@@ -256,11 +332,8 @@ impl DecLimiter {
 										Some(0) => should_drop = true,
 										Some(rate) => {
 											let ts = throttle_states.entry(0).or_insert_with(ThrottleState::new);
-											if is_outbound {
-												throttle_packet(&mut ts.ul_window, &mut ts.ul_delay_us, &mut ts.ul_integral, MAX_DELAY_US, rate, packet_len);
-											} else {
-												throttle_packet(&mut ts.dl_window, &mut ts.dl_delay_us, &mut ts.dl_integral, MAX_DELAY_US, rate, packet_len);
-											}
+											let d = if is_outbound { ts.ul(rate).consume(frame_len) } else { ts.dl(rate).consume(frame_len) };
+											delay = delay.max(d);
 										}
 										None => {}
 									}
@@ -275,11 +348,8 @@ impl DecLimiter {
 												Some(0) => should_drop = true,
 												Some(rate) => {
 													let ts = throttle_states.entry(pid).or_insert_with(ThrottleState::new);
-													if is_outbound {
-														throttle_packet(&mut ts.ul_window, &mut ts.ul_delay_us, &mut ts.ul_integral, MAX_DELAY_US, rate, packet_len);
-													} else {
-														throttle_packet(&mut ts.dl_window, &mut ts.dl_delay_us, &mut ts.dl_integral, MAX_DELAY_US, rate, packet_len);
-													}
+													let d = if is_outbound { ts.ul(rate).consume(frame_len) } else { ts.dl(rate).consume(frame_len) };
+													delay = delay.max(d);
 												}
 												None => {}
 											}
@@ -287,50 +357,34 @@ impl DecLimiter {
 									}
 								}
 							}
-
-							// Count ALL bytes toward totals (regardless of PID attribution)
-							if !should_drop {
-								if let Ok(mut t) = totals.write() {
-									if is_outbound {
-										t.upload_bytes += packet_len as u64;
-									} else {
-										t.download_bytes += packet_len as u64;
-									}
-								}
-							}
-
-							// Track per-PID traffic (skip PID 0 — covered by totals).
-							// Always update last_seen so blocked processes remain
-							// visible in the list, giving the user a way to unblock them.
-							if let Some(pid) = pid.filter(|&p| p != 0) {
-								if let Ok(mut traffic_lock) = traffic.write() {
-									let inner = traffic_lock.entry(pid).or_insert_with(|| {
-										let name = get_process_name(pid).unwrap_or_else(|| format!("PID {}", pid));
-										ProcessTrafficInner {
-											name,
-											download_bytes: 0,
-											upload_bytes: 0,
-											prev_download_bytes: 0,
-											prev_upload_bytes: 0,
-											download_speed: 0.0,
-											upload_speed: 0.0,
-											last_seen: Instant::now(),
-										}
-									});
-
-									if !should_drop {
-										if is_outbound {
-											inner.upload_bytes += packet_len as u64;
-										} else {
-											inner.download_bytes += packet_len as u64;
-										}
-									}
-									inner.last_seen = Instant::now();
-								}
-							}
 						}
 
-						if !should_drop {
+						if should_drop {
+							// Packet is blocked — do not reinject.
+							// Still update last_seen so the process stays visible.
+							if let Some(pid) = resolved_pid.filter(|&p| p != 0) {
+								if let Ok(mut traffic_lock) = traffic.write() {
+									if let Some(inner) = traffic_lock.get_mut(&pid) {
+										inner.last_seen = Instant::now();
+									}
+								}
+							}
+						} else if delay > Duration::ZERO {
+							// Defer reinjection: take the buffer, enqueue it.
+							let frame_len = packet.get_data().len();
+							let deferred = std::mem::take(&mut packet);
+							delay_queue.push_back(adapter_management::DelayedPacket {
+								buffer: deferred,
+								adapter_handle: handle,
+								is_outbound,
+								release_at: Instant::now() + delay,
+								frame_len,
+								pid: resolved_pid,
+							});
+						} else {
+							// Reinject immediately — count bytes now.
+							let frame_len = packet.get_data().len();
+							Self::count_traffic(&totals, &traffic, resolved_pid, is_outbound, frame_len);
 							if let Err(e) = reinject_packet(&driver, handle, &packet, is_outbound) {
 								error!("Monitor: packet reinject error on adapter [{}]: {}", idx, e);
 							}
@@ -376,7 +430,7 @@ impl DecLimiter {
 				}
 
 				{
-					let mut map_lock = flow_map.lock().await;
+					let mut map_lock = flow_map.write().await;
 					let now = Instant::now();
 					map_lock.retain(|_, entry| now.duration_since(entry.last_seen) < STALE_FLOW_TIMEOUT);
 				}
@@ -426,7 +480,7 @@ impl DecLimiter {
 				sleep(Duration::from_secs(60)).await;
 
 				let now = Instant::now();
-				let mut map_lock = map.lock().await;
+				let mut map_lock = map.write().await;
 
 				map_lock.retain(|flow, entry| {
 					let age = now.duration_since(entry.last_seen);
