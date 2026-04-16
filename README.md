@@ -33,12 +33,10 @@ There are 2 provided ways to limit the speed of a process.
 - Selection list shows all processes, not just the ones that actually use the network card
 - Each instance of DecLimiter currently can only handle 1 process
 
-## Immediate Todo
-- [ ] Implement a way to only show processes that use the network card in the selection list
-- [ ] Implement a way to control multiple processes with one instance of DecLimiter
-- [ ] Block upload/download completely for a process
+## Todo
+- Fix limits not updating
+- Completely remove scroll on limit input
 
 ## Long term
-- [ ] Implement a GUI
 - [ ] Implement a way to set different limits for different network interfaces
 - [ ] Backend that works on mac and linux

@@ -166,6 +166,7 @@ impl SpeedUnit {
 	}
 }
 
+#[derive(Clone, PartialEq)]
 struct ProcessLimitState {
 	dl_enabled: bool,
 	dl_value: f64,
@@ -248,7 +249,8 @@ impl ProcessLimitState {
 	}
 
 	fn has_any_setting(&self) -> bool {
-		self.dl_enabled || self.dl_blocked || self.ul_enabled || self.ul_blocked
+		self.dl_enabled || self.dl_blocked || self.dl_value > 0.0
+			|| self.ul_enabled || self.ul_blocked || self.ul_value > 0.0
 	}
 }
 
@@ -409,6 +411,7 @@ impl eframe::App for DecLimiterApp {
 		if let Some(sel_pid) = self.selected_pid {
 			let sel_stat = all_rows.iter().find(|s| s.pid == sel_pid).cloned();
 			let state = self.limit_states.entry(sel_pid).or_insert_with(ProcessLimitState::default);
+			let state_before = state.clone();
 
 			egui::SidePanel::right("details").min_width(260.0).max_width(300.0).show(ctx, |ui| {
 				if let Some(stat) = &sel_stat {
@@ -438,27 +441,19 @@ impl eframe::App for DecLimiterApp {
 					ui.label(egui::RichText::new("DL  Download").strong().size(15.0).color(egui::Color32::from_rgb(100, 200, 255)));
 					ui.add_space(4.0);
 
-					if ui.checkbox(&mut state.dl_blocked, "Block All Download").changed() {
-						limits_changed = true;
-					}
+					ui.checkbox(&mut state.dl_blocked, "Block All Download");
 
 					ui.add_space(4.0);
 					ui.horizontal(|ui| {
-						if ui.checkbox(&mut state.dl_enabled, "Limit").changed() {
-							limits_changed = true;
-						}
+						ui.checkbox(&mut state.dl_enabled, "Limit");
 						ui.add_enabled_ui(state.dl_enabled && !state.dl_blocked, |ui| {
-							if ui.add(egui::DragValue::new(&mut state.dl_value).speed(1.0).range(0.0..=999999.0).max_decimals(1)).changed() {
-								limits_changed = true;
-							}
+							ui.add(egui::DragValue::new(&mut state.dl_value).speed(0.0).range(0.0..=999999.0).max_decimals(1).update_while_editing(false));
 							egui::ComboBox::from_id_salt(("dl_unit_panel", sel_pid))
 								.selected_text(state.dl_unit.label())
 								.width(50.0)
 								.show_ui(ui, |ui| {
 									for u in SpeedUnit::ALL {
-										if ui.selectable_value(&mut state.dl_unit, u, u.label()).changed() {
-											limits_changed = true;
-										}
+										ui.selectable_value(&mut state.dl_unit, u, u.label());
 									}
 								});
 						});
@@ -470,27 +465,19 @@ impl eframe::App for DecLimiterApp {
 					ui.label(egui::RichText::new("UL  Upload").strong().size(15.0).color(egui::Color32::from_rgb(255, 180, 100)));
 					ui.add_space(4.0);
 
-					if ui.checkbox(&mut state.ul_blocked, "Block All Upload").changed() {
-						limits_changed = true;
-					}
+					ui.checkbox(&mut state.ul_blocked, "Block All Upload");
 
 					ui.add_space(4.0);
 					ui.horizontal(|ui| {
-						if ui.checkbox(&mut state.ul_enabled, "Limit").changed() {
-							limits_changed = true;
-						}
+						ui.checkbox(&mut state.ul_enabled, "Limit");
 						ui.add_enabled_ui(state.ul_enabled && !state.ul_blocked, |ui| {
-							if ui.add(egui::DragValue::new(&mut state.ul_value).speed(1.0).range(0.0..=999999.0).max_decimals(1)).changed() {
-								limits_changed = true;
-							}
+							ui.add(egui::DragValue::new(&mut state.ul_value).speed(0.0).range(0.0..=999999.0).max_decimals(1).update_while_editing(false));
 							egui::ComboBox::from_id_salt(("ul_unit_panel", sel_pid))
 								.selected_text(state.ul_unit.label())
 								.width(50.0)
 								.show_ui(ui, |ui| {
 									for u in SpeedUnit::ALL {
-										if ui.selectable_value(&mut state.ul_unit, u, u.label()).changed() {
-											limits_changed = true;
-										}
+										ui.selectable_value(&mut state.ul_unit, u, u.label());
 									}
 								});
 						});
@@ -508,6 +495,8 @@ impl eframe::App for DecLimiterApp {
 					}
 				}
 			});
+
+			limits_changed = *state != state_before;
 		}
 
 		// -- Central panel with table --
@@ -516,6 +505,7 @@ impl eframe::App for DecLimiterApp {
 		let current_selected = self.selected_pid;
 
 		egui::CentralPanel::default().show(ctx, |ui| {
+			ui.style_mut().interaction.selectable_labels = false;
 			let available_height = ui.available_height();
 
 			TableBuilder::new(ui)
