@@ -1,17 +1,17 @@
-use std::time::Duration;
+use crate::error::LimiterCLIError;
+use declimiter_lib::limiter::ProcessPair;
+use declimiter_lib::util::{Datarate, find_process, parse_datarate};
+use ratatui::Frame;
 use ratatui::crossterm::event;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind};
-use ratatui::{Frame};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::prelude::{Color, Line, Modifier, Style};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
-use declimiter_lib::limiter::ProcessPair;
-use declimiter_lib::util::{find_process, parse_datarate, Datarate};
-use crate::error::LimiterCLIError;
+use std::time::Duration;
 
 pub fn init_search() -> Result<Option<(ProcessPair, Datarate)>, LimiterCLIError> {
 	let result = open_search()?;
-	
+
 	let speed = get_download_speed()?;
 
 	Ok(result.map(|proc| (proc, speed)))
@@ -28,15 +28,11 @@ pub fn get_download_speed() -> Result<u64, LimiterCLIError> {
 			let [input_area, help_area] = layout.areas(f.area());
 
 			let block = Block::bordered().title(" Set Download Speed (bytes/sec) ");
-			let paragraph = Paragraph::new(input.as_str())
-				.block(block)
-				.style(Style::default().fg(Color::Yellow));
+			let paragraph = Paragraph::new(input.as_str()).block(block).style(Style::default().fg(Color::Yellow));
 
 			f.render_widget(paragraph, input_area);
 
-			let help = Paragraph::new("Examples: 500k, 2m, 100000 | Enter=Confirm Esc=Cancel")
-				.block(Block::bordered())
-				.style(Style::default().fg(Color::DarkGray));
+			let help = Paragraph::new("Examples: 500k, 2m, 100000 | Enter=Confirm Esc=Cancel").block(Block::bordered()).style(Style::default().fg(Color::DarkGray));
 
 			f.render_widget(help, help_area);
 		})?;
@@ -70,13 +66,12 @@ pub fn get_download_speed() -> Result<u64, LimiterCLIError> {
 	result
 }
 
-
 /// Opens a TUI for searching and selecting a process from the list of running processes.
 ///
 /// Returns the user's selected process as an `Option<ProcessPair>`, where `ProcessPair` is a tuple of (PID, Process Name).
 pub(crate) fn open_search() -> Result<Option<ProcessPair>, LimiterCLIError> {
 	let mut terminal = ratatui::init();
-	
+
 	let mut query = String::new();
 	let mut list_state = ListState::default();
 	list_state.select(Some(0));
@@ -104,8 +99,8 @@ pub(crate) fn open_search() -> Result<Option<ProcessPair>, LimiterCLIError> {
 						}
 						KeyCode::Esc => {
 							ratatui::restore();
-							return Ok(None) 
-						},
+							return Ok(None);
+						}
 
 						KeyCode::Char(c) => {
 							query.push(c);
@@ -131,9 +126,7 @@ fn ui(frame: &mut Frame, query: &str, processes: &[ProcessPair], state: &mut Lis
 	let [search_area, list_area] = layout.areas(frame.area());
 
 	let search_block = Block::bordered().title(" Search Process ");
-	let input = Paragraph::new(query)
-		.block(search_block)
-		.style(Style::default().fg(Color::Yellow));
+	let input = Paragraph::new(query).block(search_block).style(Style::default().fg(Color::Yellow));
 
 	frame.render_widget(input, search_area);
 
@@ -145,10 +138,7 @@ fn ui(frame: &mut Frame, query: &str, processes: &[ProcessPair], state: &mut Lis
 		})
 		.collect();
 
-	let list = List::new(items)
-		.block(Block::bordered().title(" Results "))
-		.highlight_style(Style::new().add_modifier(Modifier::REVERSED).fg(Color::Green))
-		.highlight_symbol(">> ");
+	let list = List::new(items).block(Block::bordered().title(" Results ")).highlight_style(Style::new().add_modifier(Modifier::REVERSED).fg(Color::Green)).highlight_symbol(">> ");
 
 	frame.render_stateful_widget(list, list_area, state);
 }

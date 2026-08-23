@@ -4,18 +4,26 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.49.0", features = ["full"] }
-log = "0.4.29"
-simple_logger = "5.1.0"
-clap = { version = "4.5.49", features = ["default", "color", "help", "suggestions", "error-context"] }
-clap_derive = "4.5.49"
+tokio = { version = "1.53.1", features = ["full"] }
+log = "0.4.34"
+simple_logger = "5.2.0"
+clap = { version = "4.6.6", features = ["default", "color", "help", "suggestions", "error-context"] }
+clap_derive = "4.6.4"
 declimiter-lib = { path = "src/declimiter-lib"}
-thiserror = "2.0.18"
-futures = { version = "0.3.31", features = []}
-ratatui = "0.30.0"
+thiserror = "2.0.20"
+futures = { version = "0.3.34", features = []}
+ratatui = "0.30.2"
 eframe = "0.30"
 egui_extras = "0.30"
-windows = { version = "0.62", features = ["Win32_System_Console"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 image = "0.25.10"
 dirs = "6"
 rusqlite = { version = "0.35", features = ["bundled"] }

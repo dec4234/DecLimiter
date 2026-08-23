@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -7,9 +7,43 @@ use declimiter_lib::limiter::{DecLimiter, LimitConfig, LimitsMap, ProcessTraffic
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
+use crate::cli::icons::IconCache;
+use crate::cli::publisher::PublisherCache;
 use crate::config::{self, ProcessConfig, ProcessesConfig};
 
 const SYSTEM_PID: u32 = 0;
+const ROW_HEIGHT: f32 = 24.0;
+const ICON_SIZE: f32 = 16.0;
+
+/// Colors of the interface. The palette is a cool, high contrast dark theme in
+/// the style of NetLimiter, with a blue accent and square corners.
+mod theme {
+	use eframe::egui::Color32;
+
+	pub const BG_WINDOW: Color32 = Color32::from_rgb(0x1B, 0x1F, 0x24);
+	pub const BG_HEADER: Color32 = Color32::from_rgb(0x23, 0x2A, 0x33);
+	pub const BG_TABLE: Color32 = Color32::from_rgb(0x13, 0x17, 0x1B);
+	pub const BG_STRIPE: Color32 = Color32::from_rgb(0x1A, 0x1F, 0x25);
+	pub const BG_INPUT: Color32 = Color32::from_rgb(0x0F, 0x12, 0x16);
+
+	pub const BORDER: Color32 = Color32::from_rgb(0x30, 0x39, 0x43);
+	pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x44, 0x50, 0x5D);
+
+	pub const TEXT: Color32 = Color32::from_rgb(0xD8, 0xDF, 0xE7);
+	pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xF2, 0xF5, 0xF8);
+	pub const TEXT_WEAK: Color32 = Color32::from_rgb(0x87, 0x95, 0xA4);
+	/// Placeholder text in the search field. Darker than TEXT_WEAK so that it
+	/// does not read as a value that is already in the field.
+	pub const HINT: Color32 = Color32::from_rgb(0x56, 0x60, 0x6C);
+
+	pub const ACCENT: Color32 = Color32::from_rgb(0x1F, 0x6F, 0xEB);
+	pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(0x58, 0xA6, 0xFF);
+
+	pub const DOWNLOAD: Color32 = Color32::from_rgb(0x4D, 0xA3, 0xFF);
+	pub const UPLOAD: Color32 = Color32::from_rgb(0x4F, 0xD1, 0x8B);
+	pub const BLOCKED: Color32 = Color32::from_rgb(0xE5, 0x53, 0x4B);
+	pub const LIMITED: Color32 = Color32::from_rgb(0xE3, 0xA8, 0x21);
+}
 
 /// Launch the GUI network monitor window.
 pub fn launch_gui() {
@@ -17,7 +51,12 @@ pub fn launch_gui() {
 
 	let stats: Arc<Mutex<Vec<ProcessTraffic>>> = Arc::new(Mutex::new(Vec::new()));
 	let system_totals: Arc<Mutex<ProcessTraffic>> = Arc::new(Mutex::new(ProcessTraffic {
-		pid: 0, name: "System".to_string(), download_bytes: 0, upload_bytes: 0, download_speed: 0.0, upload_speed: 0.0,
+		pid: 0,
+		name: "System".to_string(),
+		download_bytes: 0,
+		upload_bytes: 0,
+		download_speed: 0.0,
+		upload_speed: 0.0,
 	}));
 	let monitor_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 	let limits: Arc<Mutex<Option<LimitsMap>>> = Arc::new(Mutex::new(None));
@@ -32,10 +71,7 @@ pub fn launch_gui() {
 			let limiter = match DecLimiter::new() {
 				Ok(l) => l,
 				Err(e) => {
-					*error_bg.lock().unwrap() = Some(format!(
-						"Failed to initialize: {}\n\nMake sure:\n1. WinpkFilter driver is installed\n2. Running as Administrator",
-						e
-					));
+					*error_bg.lock().unwrap() = Some(format!("Failed to initialize: {}\n\nMake sure:\n1. WinpkFilter driver is installed\n2. Running as Administrator", e));
 					return;
 				}
 			};
@@ -64,16 +100,13 @@ pub fn launch_gui() {
 	};
 
 	let options = eframe::NativeOptions {
-		viewport: egui::ViewportBuilder::default()
-			.with_inner_size([900.0, 600.0])
-			.with_title("DecLimiter")
-			.with_icon(Arc::new(icon)),
+		viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 620.0]).with_title("DecLimiter").with_icon(Arc::new(icon)),
 		..Default::default()
 	};
 
 	// Load saved process configs and app config from disk
 	config::load_app_config();
-	let saved_processes = config::load_processes_config();
+	let group_states = load_group_states();
 
 	eframe::run_native(
 		"DecLimiter",
@@ -85,24 +118,86 @@ pub fn launch_gui() {
 				system_totals,
 				monitor_error,
 				limits_handle: limits,
-				limit_states: HashMap::new(),
+				group_states,
+				pid_states: HashMap::new(),
+				expanded: HashSet::new(),
 				sort_column: SortColumn::DownloadSpeed,
 				sort_ascending: false,
 				search_query: String::new(),
-				selected_pid: None,
-				saved_processes,
+				selection: None,
 				known_pids: HashMap::new(),
+				icons: IconCache::new(),
+				publishers: PublisherCache::new(),
 			}))
 		}),
 	)
 	.unwrap();
 }
 
+/// Applies the square cornered, blue accented theme.
 fn configure_style(ctx: &egui::Context) {
-	ctx.set_visuals(egui::Visuals::dark());
+	let mut visuals = egui::Visuals::dark();
+
+	visuals.panel_fill = theme::BG_WINDOW;
+	visuals.window_fill = theme::BG_WINDOW;
+	visuals.extreme_bg_color = theme::BG_INPUT;
+	visuals.faint_bg_color = theme::BG_STRIPE;
+	visuals.override_text_color = Some(theme::TEXT);
+
+	visuals.window_rounding = egui::Rounding::ZERO;
+	visuals.menu_rounding = egui::Rounding::ZERO;
+	visuals.window_stroke = egui::Stroke::new(1.0, theme::BORDER);
+	visuals.window_shadow = egui::epaint::Shadow::NONE;
+	visuals.popup_shadow = egui::epaint::Shadow::NONE;
+
+	visuals.selection.bg_fill = theme::ACCENT;
+	visuals.selection.stroke = egui::Stroke::new(1.0, theme::TEXT_STRONG);
+
+	visuals.widgets.noninteractive.bg_fill = theme::BG_WINDOW;
+	visuals.widgets.noninteractive.weak_bg_fill = theme::BG_WINDOW;
+	visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme::BORDER);
+	visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme::TEXT);
+
+	visuals.widgets.inactive.bg_fill = theme::BG_HEADER;
+	visuals.widgets.inactive.weak_bg_fill = theme::BG_HEADER;
+	visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, theme::BORDER);
+	visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme::TEXT);
+
+	visuals.widgets.hovered.bg_fill = theme::BG_HEADER;
+	visuals.widgets.hovered.weak_bg_fill = theme::BG_HEADER;
+	visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme::BORDER_STRONG);
+	visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_STRONG);
+
+	visuals.widgets.active.bg_fill = theme::ACCENT;
+	visuals.widgets.active.weak_bg_fill = theme::ACCENT;
+	visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, theme::ACCENT_LIGHT);
+	visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_STRONG);
+
+	visuals.widgets.open.bg_fill = theme::BG_HEADER;
+	visuals.widgets.open.weak_bg_fill = theme::BG_HEADER;
+	visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, theme::BORDER_STRONG);
+	visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, theme::TEXT);
+
+	// Square corners on every widget class.
+	for widget in [&mut visuals.widgets.noninteractive, &mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active, &mut visuals.widgets.open] {
+		widget.rounding = egui::Rounding::ZERO;
+		widget.expansion = 0.0;
+	}
+
+	ctx.set_visuals(visuals);
+
 	let mut style = (*ctx.style()).clone();
-	style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+	style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+	style.spacing.button_padding = egui::vec2(8.0, 3.0);
+	style.spacing.menu_margin = egui::Margin::same(4.0);
+	style.spacing.scroll.floating = false;
+	style.spacing.scroll.bar_width = 10.0;
 	ctx.set_style(style);
+}
+
+/// Reads the saved per process settings from disk into limit states.
+fn load_group_states() -> HashMap<String, ProcessLimitState> {
+	config::load_processes_config().iter().map(|(name, cfg)| (name.clone(), ProcessLimitState::from_process_config(cfg))).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +210,34 @@ enum SortColumn {
 	Pid,
 	DownloadSpeed,
 	UploadSpeed,
+}
+
+/// What the detail panel on the right shows.
+#[derive(Clone, PartialEq)]
+enum Selection {
+	/// All traffic, regardless of process.
+	System,
+	/// Every instance of one application, keyed by process name.
+	Group(String),
+	/// One single process instance.
+	Process(u32),
+}
+
+/// One application, together with all of its running instances.
+struct AppGroup {
+	name: String,
+	procs: Vec<ProcessTraffic>,
+	download_speed: f64,
+	upload_speed: f64,
+	download_bytes: u64,
+	upload_bytes: u64,
+}
+
+/// A line of the table. Child lines only appear while their group is expanded.
+enum VisibleRow {
+	System,
+	Group(usize),
+	Child(usize, usize),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -249,8 +372,36 @@ impl ProcessLimitState {
 	}
 
 	fn has_any_setting(&self) -> bool {
-		self.dl_enabled || self.dl_blocked || self.dl_value > 0.0
-			|| self.ul_enabled || self.ul_blocked || self.ul_value > 0.0
+		self.dl_enabled || self.dl_blocked || self.dl_value > 0.0 || self.ul_enabled || self.ul_blocked || self.ul_value > 0.0
+	}
+}
+
+/// The limit markers shown at the end of a row.
+#[derive(Clone, Copy, Default)]
+struct LimitFlags {
+	dl_active: bool,
+	ul_active: bool,
+	dl_blocked: bool,
+	ul_blocked: bool,
+}
+
+impl LimitFlags {
+	fn of(state: &ProcessLimitState) -> Self {
+		Self {
+			dl_active: state.dl_active(),
+			ul_active: state.ul_active(),
+			dl_blocked: state.dl_blocked,
+			ul_blocked: state.ul_blocked,
+		}
+	}
+
+	fn merge(self, other: Self) -> Self {
+		Self {
+			dl_active: self.dl_active || other.dl_active,
+			ul_active: self.ul_active || other.ul_active,
+			dl_blocked: self.dl_blocked || other.dl_blocked,
+			ul_blocked: self.ul_blocked || other.ul_blocked,
+		}
 	}
 }
 
@@ -263,62 +414,134 @@ struct DecLimiterApp {
 	system_totals: Arc<Mutex<ProcessTraffic>>,
 	monitor_error: Arc<Mutex<Option<String>>>,
 	limits_handle: Arc<Mutex<Option<LimitsMap>>>,
-	limit_states: HashMap<u32, ProcessLimitState>,
+	/// Limits that apply to every instance of an application. These persist.
+	group_states: HashMap<String, ProcessLimitState>,
+	/// Limits set on one single instance. These override the group limit and
+	/// are not written to disk.
+	pid_states: HashMap<u32, ProcessLimitState>,
+	/// Names of the groups whose instance list is open.
+	expanded: HashSet<String>,
 	sort_column: SortColumn,
 	sort_ascending: bool,
 	search_query: String,
-	selected_pid: Option<u32>,
-	/// Saved process configs loaded from disk, keyed by process name.
-	saved_processes: ProcessesConfig,
-	/// Tracks which process names we've already restored settings for (by PID).
+	selection: Option<Selection>,
+	/// Maps every PID we have seen to its process name.
 	known_pids: HashMap<u32, String>,
+	icons: IconCache,
+	/// Publisher of each application, read from its executable.
+	publishers: PublisherCache,
 }
 
 impl DecLimiterApp {
-	fn sort_stats(&self, stats: &mut [ProcessTraffic]) {
+	/// Collects the running processes into one group per application name.
+	fn build_groups(&self, stats: Vec<ProcessTraffic>) -> Vec<AppGroup> {
+		let mut index: HashMap<String, usize> = HashMap::new();
+		let mut groups: Vec<AppGroup> = Vec::new();
+
+		for proc in stats {
+			let idx = match index.get(&proc.name) {
+				Some(&i) => i,
+				None => {
+					groups.push(AppGroup {
+						name: proc.name.clone(),
+						procs: Vec::new(),
+						download_speed: 0.0,
+						upload_speed: 0.0,
+						download_bytes: 0,
+						upload_bytes: 0,
+					});
+					index.insert(proc.name.clone(), groups.len() - 1);
+					groups.len() - 1
+				}
+			};
+
+			let group = &mut groups[idx];
+			group.download_speed += proc.download_speed;
+			group.upload_speed += proc.upload_speed;
+			group.download_bytes += proc.download_bytes;
+			group.upload_bytes += proc.upload_bytes;
+			group.procs.push(proc);
+		}
+
+		groups
+	}
+
+	fn sort_groups(&self, groups: &mut Vec<AppGroup>) {
 		let ascending = self.sort_ascending;
-		stats.sort_by(|a, b| {
-			let ord = match self.sort_column {
+		let column = self.sort_column;
+
+		groups.sort_by(|a, b| {
+			let ord = match column {
 				SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-				SortColumn::Pid => a.pid.cmp(&b.pid),
-				SortColumn::DownloadSpeed => a.download_speed.partial_cmp(&b.download_speed).unwrap_or(std::cmp::Ordering::Equal),
-				SortColumn::UploadSpeed => a.upload_speed.partial_cmp(&b.upload_speed).unwrap_or(std::cmp::Ordering::Equal),
+				SortColumn::Pid => a.procs.len().cmp(&b.procs.len()),
+				SortColumn::DownloadSpeed => compare_f64(a.download_speed, b.download_speed),
+				SortColumn::UploadSpeed => compare_f64(a.upload_speed, b.upload_speed),
 			};
 			if ascending { ord } else { ord.reverse() }
 		});
+
+		for group in groups.iter_mut() {
+			group.procs.sort_by(|a, b| {
+				let ord = match column {
+					SortColumn::Name | SortColumn::Pid => a.pid.cmp(&b.pid),
+					SortColumn::DownloadSpeed => compare_f64(a.download_speed, b.download_speed),
+					SortColumn::UploadSpeed => compare_f64(a.upload_speed, b.upload_speed),
+				};
+				if ascending { ord } else { ord.reverse() }
+			});
+		}
 	}
 
+	/// Returns the limit that is in force for one PID: the instance override if
+	/// there is one, otherwise the limit of its application group.
+	fn effective_state(&self, pid: u32, name: &str) -> Option<&ProcessLimitState> {
+		self.pid_states.get(&pid).or_else(|| self.group_states.get(name))
+	}
+
+	fn flags_for_pid(&self, pid: u32, name: &str) -> LimitFlags {
+		self.effective_state(pid, name).map(LimitFlags::of).unwrap_or_default()
+	}
+
+	fn flags_for_group(&self, group: &AppGroup) -> LimitFlags {
+		group.procs.iter().fold(LimitFlags::default(), |acc, p| acc.merge(self.flags_for_pid(p.pid, &group.name)))
+	}
+
+	/// Pushes the current limit states down to the packet limiter.
 	fn apply_limits(&self) {
 		let handle_lock = self.limits_handle.lock().unwrap();
 		let Some(limits) = handle_lock.as_ref() else { return };
 		let mut limits_lock = limits.write().unwrap();
 		limits_lock.clear();
-		for (&pid, state) in &self.limit_states {
+
+		let mut effective: HashMap<u32, &ProcessLimitState> = HashMap::new();
+		for (&pid, name) in &self.known_pids {
+			if let Some(state) = self.group_states.get(name) {
+				effective.insert(pid, state);
+			}
+		}
+		for (&pid, state) in &self.pid_states {
+			effective.insert(pid, state);
+		}
+
+		for (pid, state) in effective {
 			let dl = state.download_byterate();
 			let ul = state.upload_byterate();
 			if dl.is_some() || ul.is_some() {
-				limits_lock.insert(pid, LimitConfig {
-					download_byterate: dl,
-					upload_byterate: ul,
-				});
+				limits_lock.insert(pid, LimitConfig { download_byterate: dl, upload_byterate: ul });
 			}
 		}
 	}
 
-	/// Save current limit states to disk, keyed by process name.
-	fn save_to_disk(&mut self) {
-		for (&pid, state) in &self.limit_states {
-			if let Some(name) = self.known_pids.get(&pid) {
-				if state.has_any_setting() {
-					self.saved_processes.insert(name.clone(), state.to_process_config());
-				} else {
-					self.saved_processes.remove(name);
-				}
+	/// Writes the per application limits to disk.
+	fn save_to_disk(&self) {
+		let mut config = ProcessesConfig::new();
+		for (name, state) in &self.group_states {
+			if state.has_any_setting() {
+				config.insert(name.clone(), state.to_process_config());
 			}
 		}
-		config::save_processes_config(&self.saved_processes);
+		config::save_processes_config(&config);
 	}
-
 }
 
 impl eframe::App for DecLimiterApp {
@@ -330,7 +553,7 @@ impl eframe::App for DecLimiterApp {
 			egui::CentralPanel::default().show(ctx, |ui| {
 				ui.vertical_centered(|ui| {
 					ui.add_space(100.0);
-					ui.heading(egui::RichText::new("Monitor Error").color(egui::Color32::RED).size(24.0));
+					ui.heading(egui::RichText::new("Monitor Error").color(theme::BLOCKED).size(24.0));
 					ui.add_space(20.0);
 					ui.label(egui::RichText::new(err).size(16.0));
 				});
@@ -340,171 +563,218 @@ impl eframe::App for DecLimiterApp {
 
 		let mut stats = self.stats.lock().unwrap().clone();
 
-		// Restore saved settings for any newly-seen processes
-		let mut restored_any = false;
+		// Keep the PID to name map current so limits follow new instances.
+		let mut new_pids = false;
 		for proc in &stats {
-			if proc.pid == SYSTEM_PID {
-				continue;
-			}
-			if !self.known_pids.contains_key(&proc.pid) {
+			if proc.pid != SYSTEM_PID && !self.known_pids.contains_key(&proc.pid) {
 				self.known_pids.insert(proc.pid, proc.name.clone());
-				if let Some(saved) = self.saved_processes.get(&proc.name) {
-					let state = ProcessLimitState::from_process_config(saved);
-					if state.has_any_setting() {
-						self.limit_states.insert(proc.pid, state);
-						restored_any = true;
-					}
-				}
+				new_pids = self.group_states.contains_key(&proc.name) || new_pids;
 			}
 		}
-		if restored_any {
+		if new_pids {
 			self.apply_limits();
 		}
 
-		// Filter by search query
+		// Filter by search query. The query matches the name, the PID, or the
+		// publisher that the executable declares.
 		if !self.search_query.is_empty() {
 			let query = self.search_query.to_lowercase();
-			stats.retain(|s| s.name.to_lowercase().contains(&query) || s.pid.to_string().contains(&query));
+			let mut kept: Vec<ProcessTraffic> = Vec::with_capacity(stats.len());
+			for proc in stats {
+				let publisher = self.publishers.get(&proc.name, proc.pid).unwrap_or_default();
+				if proc.name.to_lowercase().contains(&query) || proc.pid.to_string().contains(&query) || publisher.to_lowercase().contains(&query) {
+					kept.push(proc);
+				}
+			}
+			stats = kept;
 		}
 
-		// Use real total traffic counters for the System row
 		let system_row = self.system_totals.lock().unwrap().clone();
-		self.sort_stats(&mut stats);
+		let mut groups = self.build_groups(stats);
+		self.sort_groups(&mut groups);
 
-		// Combine: System always first
-		let mut all_rows = Vec::with_capacity(stats.len() + 1);
-		all_rows.push(system_row);
-		all_rows.extend(stats);
+		let instance_count: usize = groups.iter().map(|g| g.procs.len()).sum();
 
-		// Pre-compute limit status for each PID (read-only snapshot for table rendering)
-		let limit_indicators: HashMap<u32, (bool, bool, bool, bool)> = self.limit_states.iter()
-			.map(|(&pid, s)| (pid, (s.dl_active(), s.ul_active(), s.dl_blocked, s.ul_blocked)))
-			.collect();
+		// Flatten the groups into the lines the table draws.
+		let mut visible: Vec<VisibleRow> = vec![VisibleRow::System];
+		for (gi, group) in groups.iter().enumerate() {
+			visible.push(VisibleRow::Group(gi));
+			if group.procs.len() > 1 && self.expanded.contains(&group.name) {
+				for ci in 0..group.procs.len() {
+					visible.push(VisibleRow::Child(gi, ci));
+				}
+			}
+		}
 
 		let mut clicked_column: Option<SortColumn> = None;
-		let mut new_selected = self.selected_pid;
-		let mut limits_changed = false;
+		let mut new_selection = self.selection.clone();
+		let mut toggle_group: Option<String> = None;
 
 		// -- Top panel --
-		egui::TopBottomPanel::top("header").show(ctx, |ui| {
-			ui.add_space(4.0);
+		egui::TopBottomPanel::top("header").frame(egui::Frame::none().fill(theme::BG_HEADER).inner_margin(egui::Margin::symmetric(10.0, 6.0))).show(ctx, |ui| {
 			ui.horizontal(|ui| {
-				ui.heading("DecLimiter");
-				ui.separator();
-				ui.label("Network Monitor");
+				ui.label(egui::RichText::new("DecLimiter").strong().size(16.0).color(theme::TEXT_STRONG));
+				ui.add_space(4.0);
+				ui.label(egui::RichText::new("Network Monitor").color(theme::TEXT_WEAK));
+
 				ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-					ui.label(format!("{} processes", all_rows.len() - 1));
+					ui.label(egui::RichText::new(format!("{} apps / {} processes", groups.len(), instance_count)).color(theme::TEXT_WEAK));
 				});
 			});
-			ui.add_space(2.0);
+			ui.add_space(6.0);
 			ui.horizontal(|ui| {
-				ui.label("Search:");
-				ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(200.0).hint_text("Filter by name or PID..."));
-				if ui.button("Clear").clicked() {
-					self.search_query.clear();
+				ui.label(egui::RichText::new("Search").color(theme::TEXT_WEAK));
+				let search = ui.add(
+					egui::TextEdit::singleline(&mut self.search_query)
+						.desired_width(300.0)
+						.font(egui::FontId::proportional(14.0))
+						.margin(egui::Margin { left: 6.0, right: 26.0, top: 5.0, bottom: 5.0 })
+						.hint_text(egui::RichText::new("Name, PID, or publisher").color(theme::HINT)),
+				);
+				// The clear control sits inside the field, as in most search boxes.
+				if !self.search_query.is_empty() {
+					let rect = egui::Rect::from_min_size(egui::pos2(search.rect.right() - 22.0, search.rect.top()), egui::vec2(20.0, search.rect.height()));
+					if draw_clear_button(ui, rect).clicked() {
+						self.search_query.clear();
+					}
+				}
+				ui.separator();
+				if ui.button("Expand all").clicked() {
+					for group in &groups {
+						if group.procs.len() > 1 {
+							self.expanded.insert(group.name.clone());
+						}
+					}
+				}
+				if ui.button("Collapse all").clicked() {
+					self.expanded.clear();
 				}
 			});
-			ui.add_space(4.0);
+		});
+
+		// -- Bottom status bar --
+		egui::TopBottomPanel::bottom("status").frame(egui::Frame::none().fill(theme::BG_HEADER).inner_margin(egui::Margin::symmetric(10.0, 5.0))).show(ctx, |ui| {
+			ui.horizontal(|ui| {
+				ui.label(egui::RichText::new("Total").color(theme::TEXT_WEAK));
+				ui.separator();
+				ui.label(egui::RichText::new("DL").strong().color(theme::DOWNLOAD));
+				ui.label(egui::RichText::new(format_speed(system_row.download_speed)).color(theme::TEXT));
+				ui.separator();
+				ui.label(egui::RichText::new("UL").strong().color(theme::UPLOAD));
+				ui.label(egui::RichText::new(format_speed(system_row.upload_speed)).color(theme::TEXT));
+
+				ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+					let active = self.group_states.values().filter(|s| s.has_any_setting()).count() + self.pid_states.values().filter(|s| s.has_any_setting()).count();
+					ui.label(egui::RichText::new(format!("{active} rules active")).color(theme::TEXT_WEAK));
+				});
+			});
 		});
 
 		// -- Right detail panel --
-		if let Some(sel_pid) = self.selected_pid {
-			let sel_stat = all_rows.iter().find(|s| s.pid == sel_pid).cloned();
-			let state = self.limit_states.entry(sel_pid).or_insert_with(ProcessLimitState::default);
-			let state_before = state.clone();
+		let mut limits_changed = false;
+		let mut save_needed = false;
+		{
+			let selection = self.selection.clone();
+			egui::SidePanel::right("details").frame(egui::Frame::none().fill(theme::BG_WINDOW).inner_margin(egui::Margin::same(10.0))).resizable(false).exact_width(320.0).show(ctx, |ui| {
+				ui.set_width(ui.available_width());
 
-			egui::SidePanel::right("details").min_width(260.0).max_width(300.0).show(ctx, |ui| {
-				if let Some(stat) = &sel_stat {
-					// Header
-					ui.heading(egui::RichText::new(&stat.name).strong());
-					if sel_pid == SYSTEM_PID {
-						ui.label("All network traffic");
-					} else {
-						ui.label(format!("PID: {}", stat.pid));
+				// The close control sits in the corner of the panel and
+				// does not take a line of its own.
+				if selection.is_some() {
+					let rect = egui::Rect::from_min_size(egui::pos2(ui.max_rect().right() - 20.0, ui.max_rect().top()), egui::vec2(20.0, 20.0));
+					if draw_close_button(ui, rect).clicked() {
+						new_selection = None;
 					}
-					ui.add_space(4.0);
-					ui.horizontal(|ui| {
-						ui.label(format!("DL: {}", format_speed(stat.download_speed)));
-						ui.separator();
-						ui.label(format!("UL: {}", format_speed(stat.upload_speed)));
-					});
-					ui.add_space(2.0);
-					ui.horizontal(|ui| {
-						ui.label(format!("Total DL: {}", format_bytes(stat.download_bytes)));
-						ui.separator();
-						ui.label(format!("Total UL: {}", format_bytes(stat.upload_bytes)));
-					});
-					ui.separator();
+				}
 
-					// -- Download --
-					ui.add_space(8.0);
-					ui.label(egui::RichText::new("DL  Download").strong().size(15.0).color(egui::Color32::from_rgb(100, 200, 255)));
-					ui.add_space(4.0);
-
-					ui.checkbox(&mut state.dl_blocked, "Block All Download");
-
-					ui.add_space(4.0);
-					ui.horizontal(|ui| {
-						ui.checkbox(&mut state.dl_enabled, "Limit");
-						ui.add_enabled_ui(state.dl_enabled && !state.dl_blocked, |ui| {
-							ui.add(egui::DragValue::new(&mut state.dl_value).speed(0.0).range(0.0..=999999.0).max_decimals(1).update_while_editing(false));
-							egui::ComboBox::from_id_salt(("dl_unit_panel", sel_pid))
-								.selected_text(state.dl_unit.label())
-								.width(50.0)
-								.show_ui(ui, |ui| {
-									for u in SpeedUnit::ALL {
-										ui.selectable_value(&mut state.dl_unit, u, u.label());
-									}
-								});
-						});
-					});
-
-					ui.add_space(16.0);
-
-					// -- Upload --
-					ui.label(egui::RichText::new("UL  Upload").strong().size(15.0).color(egui::Color32::from_rgb(255, 180, 100)));
-					ui.add_space(4.0);
-
-					ui.checkbox(&mut state.ul_blocked, "Block All Upload");
-
-					ui.add_space(4.0);
-					ui.horizontal(|ui| {
-						ui.checkbox(&mut state.ul_enabled, "Limit");
-						ui.add_enabled_ui(state.ul_enabled && !state.ul_blocked, |ui| {
-							ui.add(egui::DragValue::new(&mut state.ul_value).speed(0.0).range(0.0..=999999.0).max_decimals(1).update_while_editing(false));
-							egui::ComboBox::from_id_salt(("ul_unit_panel", sel_pid))
-								.selected_text(state.ul_unit.label())
-								.width(50.0)
-								.show_ui(ui, |ui| {
-									for u in SpeedUnit::ALL {
-										ui.selectable_value(&mut state.ul_unit, u, u.label());
-									}
-								});
-						});
-					});
-
-					ui.add_space(16.0);
-					ui.separator();
-					if ui.button("Close").clicked() {
-						new_selected = None;
+				let Some(selection) = selection else {
+					detail_placeholder(ui);
+					return;
+				};
+				match &selection {
+					Selection::System => {
+						let mut state = self.pid_states.get(&SYSTEM_PID).cloned().unwrap_or_default();
+						let before = state.clone();
+						detail_header(ui, "All Traffic", "Every process on this machine", &system_row);
+						limit_editor(ui, "system", &mut state);
+						if state != before {
+							self.pid_states.insert(SYSTEM_PID, state);
+							limits_changed = true;
+						}
 					}
-				} else {
-					ui.label("Process no longer active.");
-					if ui.button("Close").clicked() {
-						new_selected = None;
+					Selection::Group(name) => {
+						let Some(group) = groups.iter().find(|g| &g.name == name) else {
+							ui.label(egui::RichText::new("Application no longer active.").color(theme::TEXT_WEAK));
+							return;
+						};
+
+						let summary = ProcessTraffic {
+							pid: 0,
+							name: group.name.clone(),
+							download_bytes: group.download_bytes,
+							upload_bytes: group.upload_bytes,
+							download_speed: group.download_speed,
+							upload_speed: group.upload_speed,
+						};
+						let subtitle = format!("{} running process(es)", group.procs.len());
+						detail_header(ui, &group.name, &subtitle, &summary);
+
+						let mut state = self.group_states.get(name).cloned().unwrap_or_default();
+						let before = state.clone();
+						limit_editor(ui, "group", &mut state);
+						if state != before {
+							// A limit set on the application replaces any
+							// limit set on its single instances.
+							for proc in &group.procs {
+								self.pid_states.remove(&proc.pid);
+							}
+							self.group_states.insert(name.clone(), state);
+							limits_changed = true;
+							save_needed = true;
+						}
+					}
+					Selection::Process(pid) => {
+						let found = groups.iter().find_map(|g| g.procs.iter().find(|p| p.pid == *pid).map(|p| (g.name.clone(), p.clone())));
+						let Some((name, proc)) = found else {
+							ui.label(egui::RichText::new("Process no longer active.").color(theme::TEXT_WEAK));
+							return;
+						};
+
+						detail_header(ui, &proc.name, &format!("PID {}", proc.pid), &proc);
+
+						let mut state = self.pid_states.get(pid).cloned().or_else(|| self.group_states.get(&name).cloned()).unwrap_or_default();
+						let before = state.clone();
+						limit_editor(ui, "process", &mut state);
+						if state != before {
+							self.pid_states.insert(*pid, state);
+							limits_changed = true;
+						}
 					}
 				}
 			});
-
-			limits_changed = *state != state_before;
 		}
 
 		// -- Central panel with table --
 		let sort_column = self.sort_column;
 		let sort_ascending = self.sort_ascending;
-		let current_selected = self.selected_pid;
+		let current = self.selection.clone();
+		let expanded = self.expanded.clone();
 
-		egui::CentralPanel::default().show(ctx, |ui| {
+		// The icon cache needs the context, so gather the textures up front.
+		let group_icons: Vec<Option<egui::TextureHandle>> = groups
+			.iter()
+			.map(|group| {
+				let pid = group.procs.first().map(|p| p.pid).unwrap_or(0);
+				self.icons.get(ctx, &group.name, pid)
+			})
+			.collect();
+
+		// Precompute the markers so the closure below does not borrow self.
+		let system_flags = self.pid_states.get(&SYSTEM_PID).map(LimitFlags::of).unwrap_or_default();
+		let group_flags: Vec<LimitFlags> = groups.iter().map(|g| self.flags_for_group(g)).collect();
+		let child_flags: Vec<Vec<LimitFlags>> = groups.iter().map(|g| g.procs.iter().map(|p| self.flags_for_pid(p.pid, &g.name)).collect()).collect();
+
+		egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG_TABLE)).show(ctx, |ui| {
 			ui.style_mut().interaction.selectable_labels = false;
 			let available_height = ui.available_height();
 
@@ -515,104 +785,148 @@ impl eframe::App for DecLimiterApp {
 				.min_scrolled_height(0.0)
 				.max_scroll_height(available_height)
 				.sense(egui::Sense::click())
-				.column(Column::auto().at_least(180.0).clip(true)) // Process
-				.column(Column::auto().at_least(60.0))             // PID
-				.column(Column::auto().at_least(120.0))            // Download
-				.column(Column::auto().at_least(120.0))            // Upload
-				.header(22.0, |mut header| {
+				.column(Column::remainder().at_least(220.0).clip(true)) // Application
+				.column(Column::initial(80.0).at_least(60.0)) // PID or instance count
+				.column(Column::initial(130.0).at_least(100.0)) // Download
+				.column(Column::initial(130.0).at_least(100.0)) // Upload
+				.header(26.0, |mut header| {
 					let columns = [
-						("Process", SortColumn::Name),
-						("PID", SortColumn::Pid),
-						("DL  Download", SortColumn::DownloadSpeed),
-						("UL  Upload", SortColumn::UploadSpeed),
+						("Application", SortColumn::Name, theme::TEXT_STRONG),
+						("PID", SortColumn::Pid, theme::TEXT_STRONG),
+						("Download", SortColumn::DownloadSpeed, theme::DOWNLOAD),
+						("Upload", SortColumn::UploadSpeed, theme::UPLOAD),
 					];
-					for (label, col) in columns {
+					for (label, col, color) in columns {
 						header.col(|ui| {
-							let arrow = if sort_column == col {
-								if sort_ascending { " ^" } else { " v" }
-							} else {
-								""
-							};
-							let text = format!("{label}{arrow}");
-							if ui
-								.add(egui::Label::new(egui::RichText::new(text).strong().color(egui::Color32::WHITE)).sense(egui::Sense::click()))
-								.clicked()
-							{
+							let bg = ui.max_rect().expand2(egui::vec2(4.0, 6.0));
+							ui.painter().rect_filled(bg, 0.0, theme::BG_HEADER);
+							ui.painter().hline(bg.x_range(), bg.bottom() - 0.5, egui::Stroke::new(1.0, theme::BORDER));
+
+							let text = egui::RichText::new(label).strong().color(color);
+							let mut response = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+							if sort_column == col {
+								response |= draw_sort_arrow(ui, sort_ascending, color);
+							}
+							if response.clicked() {
 								clicked_column = Some(col);
 							}
 						});
 					}
 				})
 				.body(|body| {
-					body.rows(22.0, all_rows.len(), |mut row| {
-						let idx = row.index();
-						let stat = &all_rows[idx];
-						let pid = stat.pid;
-						let is_system = pid == SYSTEM_PID;
-						let is_selected = current_selected == Some(pid);
+					body.rows(ROW_HEIGHT, visible.len(), |mut row| {
+						let line = &visible[row.index()];
+
+						let (name, pid_text, traffic, flags, is_child, is_selected, icon, expander) = match line {
+							VisibleRow::System => ("All Traffic".to_string(), "ALL".to_string(), &system_row, system_flags, false, current == Some(Selection::System), None, None),
+							VisibleRow::Group(gi) => {
+								let group = &groups[*gi];
+								let expandable = group.procs.len() > 1;
+								(
+									group.name.clone(),
+									if expandable { format!("{} procs", group.procs.len()) } else { group.procs[0].pid.to_string() },
+									&group.procs[0],
+									group_flags[*gi],
+									false,
+									current == Some(Selection::Group(group.name.clone())),
+									group_icons[*gi].clone(),
+									if expandable { Some(expanded.contains(&group.name)) } else { None },
+								)
+							}
+							VisibleRow::Child(gi, ci) => {
+								let proc = &groups[*gi].procs[*ci];
+								(proc.name.clone(), proc.pid.to_string(), proc, child_flags[*gi][*ci], true, current == Some(Selection::Process(proc.pid)), None, None)
+							}
+						};
+
+						// Group rows show the sum of the whole application.
+						let (dl_speed, ul_speed) = match line {
+							VisibleRow::Group(gi) => (groups[*gi].download_speed, groups[*gi].upload_speed),
+							_ => (traffic.download_speed, traffic.upload_speed),
+						};
 
 						if is_selected {
 							row.set_selected(true);
 						}
 
-						// Process name column
-						row.col(|ui| {
-							let (dl_active, ul_active, dl_blocked, ul_blocked) = limit_indicators.get(&pid).copied().unwrap_or_default();
+						let mut expander_clicked = false;
 
-							let mut text = egui::RichText::new(&stat.name);
-							if is_system {
-								text = text.strong();
+						// Application column
+						row.col(|ui| {
+							if is_child {
+								// A rule that ties the child to its group.
+								let rect = ui.max_rect();
+								ui.painter().vline(rect.left() + 8.0, rect.y_range(), egui::Stroke::new(1.0, theme::BORDER));
+								ui.add_space(16.0);
 							}
 
+							match expander {
+								Some(open) => {
+									if draw_expander(ui, open).clicked() {
+										expander_clicked = true;
+										toggle_group = Some(name.clone());
+									}
+								}
+								None => ui.add_space(14.0),
+							}
+
+							match &icon {
+								Some(texture) => {
+									ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(ICON_SIZE, ICON_SIZE)));
+								}
+								None => ui.add_space(ICON_SIZE),
+							}
+
+							let mut text = egui::RichText::new(&name);
+							if is_child {
+								text = text.color(theme::TEXT_WEAK);
+							} else if matches!(line, VisibleRow::System) {
+								text = text.strong().color(theme::ACCENT_LIGHT);
+							} else {
+								text = text.color(theme::TEXT_STRONG);
+							}
 							ui.label(text);
 
-							// Limit indicator icons
-							if dl_blocked {
-								ui.label(egui::RichText::new("DL").small().color(egui::Color32::RED));
-							} else if dl_active {
-								ui.label(egui::RichText::new("DL").small().color(egui::Color32::YELLOW));
+							if flags.dl_blocked || flags.dl_active {
+								let color = if flags.dl_blocked { theme::BLOCKED } else { theme::LIMITED };
+								ui.label(egui::RichText::new("DL").small().strong().color(color));
 							}
-							if ul_blocked {
-								ui.label(egui::RichText::new("UL").small().color(egui::Color32::RED));
-							} else if ul_active {
-								ui.label(egui::RichText::new("UL").small().color(egui::Color32::YELLOW));
+							if flags.ul_blocked || flags.ul_active {
+								let color = if flags.ul_blocked { theme::BLOCKED } else { theme::LIMITED };
+								ui.label(egui::RichText::new("UL").small().strong().color(color));
 							}
 						});
 
 						// PID column
 						row.col(|ui| {
-							if is_system {
-								ui.label(egui::RichText::new("ALL").strong());
-							} else {
-								ui.label(pid.to_string());
-							}
+							ui.label(egui::RichText::new(pid_text).color(theme::TEXT_WEAK).monospace());
 						});
 
-						// Download speed column
+						// Download column
 						row.col(|ui| {
-							let (_, _, dl_blocked, _) = limit_indicators.get(&pid).copied().unwrap_or_default();
-							if dl_blocked {
-								ui.label(egui::RichText::new("BLOCKED").color(egui::Color32::RED));
+							if flags.dl_blocked {
+								ui.label(egui::RichText::new("BLOCKED").strong().color(theme::BLOCKED));
 							} else {
-								let color = speed_color(stat.download_speed);
-								ui.label(egui::RichText::new(format_speed(stat.download_speed)).color(color));
+								ui.label(egui::RichText::new(format_speed(dl_speed)).color(speed_color(dl_speed, theme::DOWNLOAD)).monospace());
 							}
 						});
 
-						// Upload speed column
+						// Upload column
 						row.col(|ui| {
-							let (_, _, _, ul_blocked) = limit_indicators.get(&pid).copied().unwrap_or_default();
-							if ul_blocked {
-								ui.label(egui::RichText::new("BLOCKED").color(egui::Color32::RED));
+							if flags.ul_blocked {
+								ui.label(egui::RichText::new("BLOCKED").strong().color(theme::BLOCKED));
 							} else {
-								let color = speed_color(stat.upload_speed);
-								ui.label(egui::RichText::new(format_speed(stat.upload_speed)).color(color));
+								ui.label(egui::RichText::new(format_speed(ul_speed)).color(speed_color(ul_speed, theme::UPLOAD)).monospace());
 							}
 						});
 
-						// Row click detection
-						if row.response().clicked() {
-							new_selected = if is_selected { None } else { Some(pid) };
+						if row.response().clicked() && !expander_clicked {
+							let clicked = match line {
+								VisibleRow::System => Selection::System,
+								VisibleRow::Group(gi) => Selection::Group(groups[*gi].name.clone()),
+								VisibleRow::Child(gi, ci) => Selection::Process(groups[*gi].procs[*ci].pid),
+							};
+							new_selection = if is_selected { None } else { Some(clicked) };
 						}
 					});
 				});
@@ -628,18 +942,175 @@ impl eframe::App for DecLimiterApp {
 			}
 		}
 
-		self.selected_pid = new_selected;
+		if let Some(name) = toggle_group {
+			if !self.expanded.remove(&name) {
+				self.expanded.insert(name);
+			}
+		}
+
+		self.selection = new_selection;
 
 		if limits_changed {
 			self.apply_limits();
+		}
+		if save_needed {
 			self.save_to_disk();
 		}
 	}
 }
 
 // ---------------------------------------------------------------------------
+// Widgets
+// ---------------------------------------------------------------------------
+
+/// Draws the triangle that opens and closes a group.
+fn draw_expander(ui: &mut egui::Ui, open: bool) -> egui::Response {
+	let (rect, response) = ui.allocate_exact_size(egui::vec2(14.0, ROW_HEIGHT), egui::Sense::click());
+	let color = if response.hovered() { theme::TEXT_STRONG } else { theme::TEXT_WEAK };
+	let center = rect.center();
+
+	let points = if open {
+		vec![center + egui::vec2(-4.0, -2.0), center + egui::vec2(4.0, -2.0), center + egui::vec2(0.0, 3.0)]
+	} else {
+		vec![center + egui::vec2(-2.0, -4.0), center + egui::vec2(3.0, 0.0), center + egui::vec2(-2.0, 4.0)]
+	};
+
+	ui.painter().add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+	response
+}
+
+/// Draws the triangle that shows the sort direction of a column. The shape
+/// matches the expander triangle of a grouped application.
+fn draw_sort_arrow(ui: &mut egui::Ui, ascending: bool, color: egui::Color32) -> egui::Response {
+	let (rect, response) = ui.allocate_exact_size(egui::vec2(12.0, ui.available_height()), egui::Sense::click());
+	let center = rect.center();
+
+	let points = if ascending {
+		vec![center + egui::vec2(-4.0, 2.0), center + egui::vec2(4.0, 2.0), center + egui::vec2(0.0, -3.0)]
+	} else {
+		vec![center + egui::vec2(-4.0, -2.0), center + egui::vec2(4.0, -2.0), center + egui::vec2(0.0, 3.0)]
+	};
+
+	ui.painter().add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+	response
+}
+
+/// Draws the x that closes the detail panel. The mark is painted, not a glyph,
+/// because the default fonts do not have a cross character.
+fn draw_close_button(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
+	let response = ui.allocate_rect(rect, egui::Sense::click());
+	let color = if response.hovered() { theme::TEXT_STRONG } else { theme::TEXT_WEAK };
+	if response.hovered() {
+		ui.painter().rect_filled(rect, 0.0, theme::BG_HEADER);
+	}
+	let center = rect.center();
+	let arm = 5.0;
+	let stroke = egui::Stroke::new(1.6, color);
+	ui.painter().line_segment([center + egui::vec2(-arm, -arm), center + egui::vec2(arm, arm)], stroke);
+	ui.painter().line_segment([center + egui::vec2(arm, -arm), center + egui::vec2(-arm, arm)], stroke);
+	response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Draws the small x that empties the search field. The mark is painted, not a
+/// glyph, because the default fonts do not have a cross character.
+fn draw_clear_button(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
+	let response = ui.allocate_rect(rect, egui::Sense::click());
+	let color = if response.hovered() { theme::TEXT_STRONG } else { theme::TEXT_WEAK };
+	let center = rect.center();
+	let arm = 4.0;
+	let stroke = egui::Stroke::new(1.4, color);
+	ui.painter().line_segment([center + egui::vec2(-arm, -arm), center + egui::vec2(arm, arm)], stroke);
+	ui.painter().line_segment([center + egui::vec2(arm, -arm), center + egui::vec2(-arm, arm)], stroke);
+	response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Shown in the detail panel while no row is selected, so the panel keeps its
+/// place on screen instead of appearing over the table.
+fn detail_placeholder(ui: &mut egui::Ui) {
+	ui.label(egui::RichText::new("Limits").strong().size(17.0).color(theme::TEXT_STRONG));
+	ui.label(egui::RichText::new("No selection").color(theme::TEXT_WEAK));
+	ui.add_space(10.0);
+	ui.label(egui::RichText::new("Select a row in the table to see its traffic and to set a block or a speed limit.").color(theme::TEXT_WEAK));
+}
+
+/// The title block at the top of the detail panel.
+fn detail_header(ui: &mut egui::Ui, title: &str, subtitle: &str, traffic: &ProcessTraffic) {
+	ui.label(egui::RichText::new(title).strong().size(17.0).color(theme::TEXT_STRONG));
+	ui.label(egui::RichText::new(subtitle).color(theme::TEXT_WEAK));
+	ui.add_space(8.0);
+
+	egui::Frame::none().fill(theme::BG_TABLE).stroke(egui::Stroke::new(1.0, theme::BORDER)).inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
+		ui.set_width(ui.available_width());
+		stat_line(ui, "Download", format_speed(traffic.download_speed), theme::DOWNLOAD);
+		stat_line(ui, "Upload", format_speed(traffic.upload_speed), theme::UPLOAD);
+		ui.add_space(4.0);
+		stat_line(ui, "Total down", format_bytes(traffic.download_bytes), theme::TEXT_WEAK);
+		stat_line(ui, "Total up", format_bytes(traffic.upload_bytes), theme::TEXT_WEAK);
+	});
+	ui.add_space(10.0);
+}
+
+fn stat_line(ui: &mut egui::Ui, label: &str, value: String, color: egui::Color32) {
+	ui.horizontal(|ui| {
+		ui.label(egui::RichText::new(label).color(theme::TEXT_WEAK));
+		ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+			ui.label(egui::RichText::new(value).strong().monospace().color(color));
+		});
+	});
+}
+
+/// The block of block and limit controls for one selection.
+fn limit_editor(ui: &mut egui::Ui, id: &str, state: &mut ProcessLimitState) {
+	section_title(ui, "Download", theme::DOWNLOAD);
+	ui.checkbox(&mut state.dl_blocked, "Block all download");
+	ui.add_space(2.0);
+	ui.horizontal(|ui| {
+		ui.checkbox(&mut state.dl_enabled, "Limit to");
+		ui.add_enabled_ui(state.dl_enabled && !state.dl_blocked, |ui| {
+			ui.add(egui::DragValue::new(&mut state.dl_value).speed(0.0).range(0.0..=999999.0).max_decimals(1).update_while_editing(false));
+			egui::ComboBox::from_id_salt(("dl_unit", id)).selected_text(state.dl_unit.label()).width(60.0).show_ui(ui, |ui| {
+				for unit in SpeedUnit::ALL {
+					ui.selectable_value(&mut state.dl_unit, unit, unit.label());
+				}
+			});
+		});
+	});
+
+	ui.add_space(14.0);
+
+	section_title(ui, "Upload", theme::UPLOAD);
+	ui.checkbox(&mut state.ul_blocked, "Block all upload");
+	ui.add_space(2.0);
+	ui.horizontal(|ui| {
+		ui.checkbox(&mut state.ul_enabled, "Limit to");
+		ui.add_enabled_ui(state.ul_enabled && !state.ul_blocked, |ui| {
+			ui.add(egui::DragValue::new(&mut state.ul_value).speed(0.0).range(0.0..=999999.0).max_decimals(1).update_while_editing(false));
+			egui::ComboBox::from_id_salt(("ul_unit", id)).selected_text(state.ul_unit.label()).width(60.0).show_ui(ui, |ui| {
+				for unit in SpeedUnit::ALL {
+					ui.selectable_value(&mut state.ul_unit, unit, unit.label());
+				}
+			});
+		});
+	});
+}
+
+/// A colored bar and a caption that start a section of the detail panel.
+fn section_title(ui: &mut egui::Ui, title: &str, color: egui::Color32) {
+	ui.horizontal(|ui| {
+		let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+		ui.painter().rect_filled(rect, 0.0, color);
+		ui.label(egui::RichText::new(title.to_uppercase()).strong().size(13.0).color(color));
+	});
+	ui.add_space(4.0);
+}
+
+// ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
+
+fn compare_f64(a: f64, b: f64) -> std::cmp::Ordering {
+	a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+}
 
 fn format_speed(bytes_per_sec: f64) -> String {
 	if bytes_per_sec < 1.0 {
@@ -667,14 +1138,13 @@ fn format_bytes(bytes: u64) -> String {
 	}
 }
 
-fn speed_color(bytes_per_sec: f64) -> egui::Color32 {
+/// Idle traffic is dimmed so that the active rows stand out.
+fn speed_color(bytes_per_sec: f64, active: egui::Color32) -> egui::Color32 {
 	if bytes_per_sec < 1.0 {
-		egui::Color32::GRAY
+		theme::TEXT_WEAK.gamma_multiply(0.7)
 	} else if bytes_per_sec < 10_240.0 {
-		egui::Color32::LIGHT_GRAY
-	} else if bytes_per_sec < 1_048_576.0 {
-		egui::Color32::from_rgb(100, 200, 255)
+		theme::TEXT
 	} else {
-		egui::Color32::from_rgb(100, 255, 100)
+		active
 	}
 }

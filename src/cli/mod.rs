@@ -1,5 +1,7 @@
 pub mod gui;
+mod icons;
 mod process_list;
+mod publisher;
 
 use crate::cli::process_list::init_search;
 use crate::error::LimiterCLIError;
@@ -32,11 +34,9 @@ pub async fn handle_startup() -> Result<bool, LimiterCLIError> {
 		if let Some((proc, speed)) = init_search()? {
 			let limiter = DecLimiter::new()?;
 
-			try_join!(
-				async { limiter.start().await.expect("Task panicked") },
-				async { limiter.limit_speed_pid(proc.0, Some(speed), None).await.expect("Task panicked") },
-				async { limiter.garbage_collect_flows(Duration::from_secs(60)).await.expect("Task panicked") }
-			)
+			try_join!(async { limiter.start().await.expect("Task panicked") }, async { limiter.limit_speed_pid(proc.0, Some(speed), None).await.expect("Task panicked") }, async {
+				limiter.garbage_collect_flows(Duration::from_secs(60)).await.expect("Task panicked")
+			})
 			.map_err(|e| LimiterCLIError::ExecutionError(e.to_string()))?;
 		} else {
 			println!("No process selected. Exiting.");
@@ -85,10 +85,7 @@ pub async fn execute(args: DecLimiterArgs) -> Result<(), LimiterCLIError> {
 	let pid = args.pid.expect("PID is required for direct mode");
 	let limiter = DecLimiter::new()?;
 
-	let mut vec = vec![
-		limiter.start(),
-		limiter.garbage_collect_flows(Duration::from_secs(args.garbage_collect as u64)),
-	];
+	let mut vec = vec![limiter.start(), limiter.garbage_collect_flows(Duration::from_secs(args.garbage_collect as u64))];
 
 	if args.download.is_some() || args.upload.is_some() {
 		vec.push(limiter.limit_speed_pid(pid, args.download, args.upload));

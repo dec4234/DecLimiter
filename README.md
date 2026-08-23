@@ -34,8 +34,9 @@ There are 2 provided ways to limit the speed of a process.
 - Each instance of DecLimiter currently can only handle 1 process
 
 ## Todo
-- Fix limits not updating
 - Completely remove scroll on limit input
+- Doesn't reconnect if adapter disconnects and reconnects
+- Readings still ~5% inaccurate
 
 ## Long term
 - [ ] Implement a way to set different limits for different network interfaces
