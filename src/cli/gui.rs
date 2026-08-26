@@ -126,6 +126,7 @@ pub fn launch_gui() {
 				search_query: String::new(),
 				selection: None,
 				known_pids: HashMap::new(),
+				frozen_order: None,
 				icons: IconCache::new(),
 				publishers: PublisherCache::new(),
 			}))
@@ -231,6 +232,41 @@ struct AppGroup {
 	upload_speed: f64,
 	download_bytes: u64,
 	upload_bytes: u64,
+}
+
+/// The row order of one frame, kept so that the table can hold that order
+/// while the user keeps the Ctrl key down. Windows Task Manager does the same.
+struct FrozenOrder {
+	/// Application names, in the order they were shown when the key went down.
+	groups: Vec<String>,
+	/// For each application name, the PIDs in the order they were shown.
+	procs: HashMap<String, Vec<u32>>,
+}
+
+impl FrozenOrder {
+	/// Records the order of the groups as they are now.
+	fn capture(groups: &[AppGroup]) -> Self {
+		FrozenOrder {
+			groups: groups.iter().map(|g| g.name.clone()).collect(),
+			procs: groups.iter().map(|g| (g.name.clone(), g.procs.iter().map(|p| p.pid).collect())).collect(),
+		}
+	}
+
+	/// Puts the groups back into the recorded order. Applications and
+	/// processes that started after the freeze keep their sorted order and go
+	/// to the end, so that the recorded lines never move.
+	fn apply(&self, groups: &mut [AppGroup]) {
+		let rank: HashMap<&str, usize> = self.groups.iter().enumerate().map(|(i, name)| (name.as_str(), i)).collect();
+		groups.sort_by_key(|g| rank.get(g.name.as_str()).copied().unwrap_or(usize::MAX));
+
+		for group in groups.iter_mut() {
+			let Some(pids) = self.procs.get(&group.name) else {
+				continue;
+			};
+			let pid_rank: HashMap<u32, usize> = pids.iter().enumerate().map(|(i, pid)| (*pid, i)).collect();
+			group.procs.sort_by_key(|p| pid_rank.get(&p.pid).copied().unwrap_or(usize::MAX));
+		}
+	}
 }
 
 /// A line of the table. Child lines only appear while their group is expanded.
@@ -427,6 +463,9 @@ struct DecLimiterApp {
 	selection: Option<Selection>,
 	/// Maps every PID we have seen to its process name.
 	known_pids: HashMap<u32, String>,
+	/// The row order that is held while the user keeps the Ctrl key down. It
+	/// is `None` when the table sorts freely.
+	frozen_order: Option<FrozenOrder>,
 	icons: IconCache,
 	/// Publisher of each application, read from its executable.
 	publishers: PublisherCache,
@@ -593,6 +632,18 @@ impl eframe::App for DecLimiterApp {
 		let mut groups = self.build_groups(stats);
 		self.sort_groups(&mut groups);
 
+		// Hold the row order while the Ctrl key is down. The speeds keep
+		// updating, but no line moves, so that a row is easy to click.
+		let freeze_held = ctx.input(|i| i.modifiers.ctrl);
+		if freeze_held {
+			match &self.frozen_order {
+				Some(order) => order.apply(&mut groups),
+				None => self.frozen_order = Some(FrozenOrder::capture(&groups)),
+			}
+		} else {
+			self.frozen_order = None;
+		}
+
 		let instance_count: usize = groups.iter().map(|g| g.procs.len()).sum();
 
 		// Flatten the groups into the lines the table draws.
@@ -619,6 +670,10 @@ impl eframe::App for DecLimiterApp {
 
 				ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
 					ui.label(egui::RichText::new(format!("{} apps / {} processes", groups.len(), instance_count)).color(theme::TEXT_WEAK));
+					if freeze_held {
+						ui.add_space(10.0);
+						ui.label(egui::RichText::new("Order held (Ctrl)").color(theme::LIMITED));
+					}
 				});
 			});
 			ui.add_space(6.0);

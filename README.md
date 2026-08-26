@@ -1,6 +1,8 @@
 # DecLimiter
 A free alternative to [NetLimiter](https://www.netlimiter.com/) on Windows.
 
+![](assets/img.png)
+
 ## Installation
 1. Compile DecLimiter from source or get an exe from [releases](https://github.com/dec4234/DecLimiter/releases)
 ```shell
