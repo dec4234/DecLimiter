@@ -14,6 +14,10 @@ use crate::config::{self, ProcessConfig, ProcessesConfig};
 const SYSTEM_PID: u32 = 0;
 const ROW_HEIGHT: f32 = 24.0;
 const ICON_SIZE: f32 = 16.0;
+/// The part of the header width that the search field uses.
+const SEARCH_WIDTH_FRACTION: f32 = 0.35;
+/// Kept free at the right of the search row for the expand and collapse buttons.
+const SEARCH_BUTTON_SPACE: f32 = 200.0;
 
 /// Colors of the interface. The palette is a cool, high contrast dark theme in
 /// the style of NetLimiter, with a blue accent and square corners.
@@ -60,11 +64,14 @@ pub fn launch_gui() {
 	}));
 	let monitor_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 	let limits: Arc<Mutex<Option<LimitsMap>>> = Arc::new(Mutex::new(None));
+	// PIDs of the processes that ended, which the interface has not yet read.
+	let exited: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
 	let stats_bg = stats.clone();
 	let totals_bg = system_totals.clone();
 	let error_bg = monitor_error.clone();
 	let limits_bg = limits.clone();
+	let exited_bg = exited.clone();
 	thread::spawn(move || {
 		let rt = tokio::runtime::Runtime::new().unwrap();
 		rt.block_on(async {
@@ -83,6 +90,13 @@ pub fn launch_gui() {
 			limiter.start_speed_calculator();
 
 			loop {
+				// Drop the processes that ended before the snapshot is taken,
+				// so that the list never shows a process that no longer runs.
+				let gone = limiter.reap_exited();
+				if !gone.is_empty() {
+					exited_bg.lock().unwrap().extend(gone);
+				}
+
 				let snapshot = limiter.get_snapshot();
 				let totals = limiter.get_totals();
 				*stats_bg.lock().unwrap() = snapshot;
@@ -118,6 +132,7 @@ pub fn launch_gui() {
 				system_totals,
 				monitor_error,
 				limits_handle: limits,
+				exited,
 				group_states,
 				pid_states: HashMap::new(),
 				expanded: HashSet::new(),
@@ -450,6 +465,8 @@ struct DecLimiterApp {
 	system_totals: Arc<Mutex<ProcessTraffic>>,
 	monitor_error: Arc<Mutex<Option<String>>>,
 	limits_handle: Arc<Mutex<Option<LimitsMap>>>,
+	/// PIDs of the processes that ended since the last frame.
+	exited: Arc<Mutex<Vec<u32>>>,
 	/// Limits that apply to every instance of an application. These persist.
 	group_states: HashMap<String, ProcessLimitState>,
 	/// Limits set on one single instance. These override the group limit and
@@ -602,15 +619,32 @@ impl eframe::App for DecLimiterApp {
 
 		let mut stats = self.stats.lock().unwrap().clone();
 
+		// Forget the processes that ended. Windows reports the end of a
+		// process at once, thus the row goes away immediately.
+		let gone: Vec<u32> = std::mem::take(&mut *self.exited.lock().unwrap());
+		let mut limits_changed = false;
+		for pid in &gone {
+			let was_known = self.known_pids.remove(pid).is_some();
+			let had_override = self.pid_states.remove(pid).is_some();
+			limits_changed = limits_changed || was_known || had_override;
+
+			if self.selection == Some(Selection::Process(*pid)) {
+				self.selection = None;
+			}
+		}
+		if !gone.is_empty() {
+			let dead: HashSet<u32> = gone.into_iter().collect();
+			stats.retain(|proc| !dead.contains(&proc.pid));
+		}
+
 		// Keep the PID to name map current so limits follow new instances.
-		let mut new_pids = false;
 		for proc in &stats {
 			if proc.pid != SYSTEM_PID && !self.known_pids.contains_key(&proc.pid) {
 				self.known_pids.insert(proc.pid, proc.name.clone());
-				new_pids = self.group_states.contains_key(&proc.name) || new_pids;
+				limits_changed = self.group_states.contains_key(&proc.name) || limits_changed;
 			}
 		}
-		if new_pids {
+		if limits_changed {
 			self.apply_limits();
 		}
 
@@ -679,31 +713,38 @@ impl eframe::App for DecLimiterApp {
 			ui.add_space(6.0);
 			ui.horizontal(|ui| {
 				ui.label(egui::RichText::new("Search").color(theme::TEXT_WEAK));
+				// The field keeps the same share of the window at all sizes,
+				// but never grows into the space that the buttons need. The
+				// text scrolls inside the field when it is longer than that.
+				let space_left = ui.available_width();
+				let field_width = (space_left * SEARCH_WIDTH_FRACTION).min(space_left - SEARCH_BUTTON_SPACE).max(60.0);
 				let search = ui.add(
 					egui::TextEdit::singleline(&mut self.search_query)
-						.desired_width(300.0)
+						.desired_width(field_width)
 						.font(egui::FontId::proportional(14.0))
-						.margin(egui::Margin { left: 6.0, right: 26.0, top: 5.0, bottom: 5.0 })
+						.margin(egui::Margin { left: 6.0, right: 24.0, top: 5.0, bottom: 5.0 })
 						.hint_text(egui::RichText::new("Name, PID, or publisher").color(theme::HINT)),
 				);
-				// The clear control sits inside the field, as in most search boxes.
+				// The clear control sits at the right end of the field, as in
+				// most search boxes.
 				if !self.search_query.is_empty() {
-					let rect = egui::Rect::from_min_size(egui::pos2(search.rect.right() - 22.0, search.rect.top()), egui::vec2(20.0, search.rect.height()));
+					let rect = egui::Rect::from_min_max(egui::pos2(search.rect.right() - 20.0, search.rect.top()), search.rect.right_bottom());
 					if draw_clear_button(ui, rect).clicked() {
 						self.search_query.clear();
 					}
 				}
-				ui.separator();
-				if ui.button("Expand all").clicked() {
-					for group in &groups {
-						if group.procs.len() > 1 {
-							self.expanded.insert(group.name.clone());
+				ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+					if ui.button("Collapse all").clicked() {
+						self.expanded.clear();
+					}
+					if ui.button("Expand all").clicked() {
+						for group in &groups {
+							if group.procs.len() > 1 {
+								self.expanded.insert(group.name.clone());
+							}
 						}
 					}
-				}
-				if ui.button("Collapse all").clicked() {
-					self.expanded.clear();
-				}
+				});
 			});
 		});
 

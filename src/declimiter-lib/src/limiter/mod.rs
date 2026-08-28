@@ -1,10 +1,12 @@
 pub mod adapter_management;
 pub mod network;
 pub mod packets;
+pub mod process_watch;
 
 use crate::error::DecLimiterError;
 use crate::limiter::network::{FlowAddress, FlowEntry, parse_flow_dest, parse_flow_source};
 use crate::limiter::packets::{TokenBucket, read_packet, reinject_packet};
+use crate::limiter::process_watch::ProcessWatcher;
 use crate::util::get_process_name;
 use log::{debug, error, trace};
 use ndisapi::{DirectionFlags, IntermediateBuffer, Ndisapi};
@@ -96,6 +98,8 @@ pub struct DecLimiter {
 	traffic: Arc<std::sync::RwLock<HashMap<u32, ProcessTrafficInner>>>,
 	totals: Arc<std::sync::RwLock<TotalTrafficCounters>>,
 	limits: LimitsMap,
+	/// Tells us as soon as a process that we track ends.
+	watcher: Arc<ProcessWatcher>,
 }
 
 impl DecLimiter {
@@ -126,6 +130,7 @@ impl DecLimiter {
 				upload_speed: 0.0,
 			})),
 			limits: Arc::new(std::sync::RwLock::new(HashMap::new())),
+			watcher: Arc::new(ProcessWatcher::new()),
 		})
 	}
 
@@ -154,7 +159,7 @@ impl DecLimiter {
 	/// Record bytes in the total and per-PID traffic counters.
 	/// Called at *reinjection* time so the speed display reflects actual
 	/// delivered throughput, not intercepted-but-queued traffic.
-	fn count_traffic(totals: &Arc<std::sync::RwLock<TotalTrafficCounters>>, traffic: &Arc<std::sync::RwLock<HashMap<u32, ProcessTrafficInner>>>, pid: Option<u32>, is_outbound: bool, frame_len: usize) {
+	fn count_traffic(totals: &Arc<std::sync::RwLock<TotalTrafficCounters>>, traffic: &Arc<std::sync::RwLock<HashMap<u32, ProcessTrafficInner>>>, watcher: &Arc<ProcessWatcher>, pid: Option<u32>, is_outbound: bool, frame_len: usize) {
 		if let Ok(mut t) = totals.write() {
 			if is_outbound {
 				t.upload_bytes += frame_len as u64;
@@ -165,7 +170,9 @@ impl DecLimiter {
 
 		if let Some(pid) = pid.filter(|&p| p != 0) {
 			if let Ok(mut traffic_lock) = traffic.write() {
+				let mut is_new = false;
 				let inner = traffic_lock.entry(pid).or_insert_with(|| {
+					is_new = true;
 					let name = get_process_name(pid).unwrap_or_else(|| format!("PID {}", pid));
 					ProcessTrafficInner {
 						name,
@@ -184,6 +191,13 @@ impl DecLimiter {
 					inner.download_bytes += frame_len as u64;
 				}
 				inner.last_seen = Instant::now();
+				drop(traffic_lock);
+
+				// Ask Windows to tell us when this process ends, so that the
+				// list drops it at once instead of after the timeout.
+				if is_new {
+					watcher.watch(pid);
+				}
 			}
 		}
 	}
@@ -266,6 +280,7 @@ impl DecLimiter {
 		let traffic = self.traffic.clone();
 		let totals = self.totals.clone();
 		let limits = self.limits.clone();
+		let watcher = self.watcher.clone();
 
 		tokio::task::spawn_blocking(move || {
 			debug!("Starting packet monitor...");
@@ -288,7 +303,7 @@ impl DecLimiter {
 				reinjected.clear();
 				adapter_management::flush_delayed(&driver, &mut delay_queue, &mut reinjected);
 				for info in &reinjected {
-					Self::count_traffic(&totals, &traffic, info.pid, info.is_outbound, info.frame_len);
+					Self::count_traffic(&totals, &traffic, &watcher, info.pid, info.is_outbound, info.frame_len);
 				}
 
 				for (idx, &handle) in adapter_handles.iter().enumerate() {
@@ -384,7 +399,7 @@ impl DecLimiter {
 						} else {
 							// Reinject immediately — count bytes now.
 							let frame_len = packet.get_data().len();
-							Self::count_traffic(&totals, &traffic, resolved_pid, is_outbound, frame_len);
+							Self::count_traffic(&totals, &traffic, &watcher, resolved_pid, is_outbound, frame_len);
 							if let Err(e) = reinject_packet(&driver, handle, &packet, is_outbound) {
 								error!("Monitor: packet reinject error on adapter [{}]: {}", idx, e);
 							}
@@ -405,21 +420,35 @@ impl DecLimiter {
 		let traffic = self.traffic.clone();
 		let totals = self.totals.clone();
 		let flow_map = self.map.clone();
+		let watcher = self.watcher.clone();
 
 		tokio::spawn(async move {
 			debug!("Starting speed calculator...");
 			loop {
 				sleep(SPEED_UPDATE_INTERVAL).await;
 
+				let mut stale: Vec<u32> = Vec::new();
+
 				if let Ok(mut lock) = traffic.write() {
 					let now = Instant::now();
-					lock.retain(|_, inner| {
+					lock.retain(|&pid, inner| {
 						inner.download_speed = (inner.download_bytes - inner.prev_download_bytes) as f64;
 						inner.upload_speed = (inner.upload_bytes - inner.prev_upload_bytes) as f64;
 						inner.prev_download_bytes = inner.download_bytes;
 						inner.prev_upload_bytes = inner.upload_bytes;
-						now.duration_since(inner.last_seen) < STALE_ENTRY_TIMEOUT
+
+						let keep = now.duration_since(inner.last_seen) < STALE_ENTRY_TIMEOUT;
+						if !keep {
+							stale.push(pid);
+						}
+						keep
 					});
+				}
+
+				// A process that stops to send traffic can keep running. Release
+				// its exit wait, because the list no longer shows it.
+				for pid in stale {
+					watcher.forget(pid);
 				}
 
 				if let Ok(mut t) = totals.write() {
@@ -436,6 +465,38 @@ impl DecLimiter {
 				}
 			}
 		})
+	}
+
+	/// Removes the processes that ended since the last call, and returns their
+	/// PIDs.
+	///
+	/// Windows reports the end of a process at once, thus a call to this
+	/// function immediately before [`Self::get_snapshot`] keeps the list free
+	/// of processes that no longer run.
+	pub fn reap_exited(&self) -> Vec<u32> {
+		let exited = self.watcher.take_exited();
+
+		if exited.is_empty() {
+			return exited;
+		}
+
+		if let Ok(mut traffic_lock) = self.traffic.write() {
+			for pid in &exited {
+				traffic_lock.remove(pid);
+			}
+		}
+
+		// A limit on a PID that no longer runs must not apply to a different
+		// process that receives the same PID later.
+		if let Ok(mut limits_lock) = self.limits.write() {
+			for pid in &exited {
+				limits_lock.remove(pid);
+			}
+		}
+
+		debug!("Removed {} process(es) that ended: {:?}", exited.len(), exited);
+
+		exited
 	}
 
 	/// Get a snapshot of all process traffic stats, sorted by download speed descending.
