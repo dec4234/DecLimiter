@@ -144,6 +144,7 @@ pub fn launch_gui() {
 				frozen_order: None,
 				icons: IconCache::new(),
 				publishers: PublisherCache::new(),
+				pins: Vec::new(),
 			}))
 		}),
 	)
@@ -160,8 +161,8 @@ fn configure_style(ctx: &egui::Context) {
 	visuals.faint_bg_color = theme::BG_STRIPE;
 	visuals.override_text_color = Some(theme::TEXT);
 
-	visuals.window_rounding = egui::Rounding::ZERO;
-	visuals.menu_rounding = egui::Rounding::ZERO;
+	visuals.window_corner_radius = egui::CornerRadius::ZERO;
+	visuals.menu_corner_radius = egui::CornerRadius::ZERO;
 	visuals.window_stroke = egui::Stroke::new(1.0, theme::BORDER);
 	visuals.window_shadow = egui::epaint::Shadow::NONE;
 	visuals.popup_shadow = egui::epaint::Shadow::NONE;
@@ -196,19 +197,19 @@ fn configure_style(ctx: &egui::Context) {
 
 	// Square corners on every widget class.
 	for widget in [&mut visuals.widgets.noninteractive, &mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active, &mut visuals.widgets.open] {
-		widget.rounding = egui::Rounding::ZERO;
+		widget.corner_radius = egui::CornerRadius::ZERO;
 		widget.expansion = 0.0;
 	}
 
 	ctx.set_visuals(visuals);
 
-	let mut style = (*ctx.style()).clone();
+	let mut style = (*ctx.global_style()).clone();
 	style.spacing.item_spacing = egui::vec2(6.0, 4.0);
 	style.spacing.button_padding = egui::vec2(8.0, 3.0);
-	style.spacing.menu_margin = egui::Margin::same(4.0);
+	style.spacing.menu_margin = egui::Margin::same(4);
 	style.spacing.scroll.floating = false;
 	style.spacing.scroll.bar_width = 10.0;
-	ctx.set_style(style);
+	ctx.set_global_style(style);
 }
 
 /// Reads the saved per process settings from disk into limit states.
@@ -237,6 +238,15 @@ enum Selection {
 	Group(String),
 	/// One single process instance.
 	Process(u32),
+}
+
+/// A line that the user holds at the top of the table.
+#[derive(Clone, PartialEq)]
+enum PinTarget {
+	/// Every instance of one application, keyed by process name.
+	Group(String),
+	/// One single process instance.
+	Pid(u32),
 }
 
 /// One application, together with all of its running instances.
@@ -486,6 +496,9 @@ struct DecLimiterApp {
 	icons: IconCache,
 	/// Publisher of each application, read from its executable.
 	publishers: PublisherCache,
+	/// The lines the user pinned, in the order they were pinned. Pinned lines
+	/// stay at the top of the table until the process ends.
+	pins: Vec<PinTarget>,
 }
 
 impl DecLimiterApp {
@@ -548,6 +561,44 @@ impl DecLimiterApp {
 		}
 	}
 
+	fn is_pinned(&self, target: &PinTarget) -> bool {
+		self.pins.contains(target)
+	}
+
+	fn pin_rank(&self, target: &PinTarget) -> Option<usize> {
+		self.pins.iter().position(|pin| pin == target)
+	}
+
+	/// Adds the pin if the line has none, removes it if the line has one.
+	fn toggle_pin(&mut self, target: PinTarget) {
+		match self.pin_rank(&target) {
+			Some(index) => {
+				self.pins.remove(index);
+			}
+			None => self.pins.push(target),
+		}
+	}
+
+	/// Moves the pinned lines to the top. Pinned lines keep the order in which
+	/// they were pinned; all other lines keep the order the sort gave them.
+	/// An application also goes to the top while one of its instances is
+	/// pinned, because a child line is only visible below its application.
+	fn apply_pins(&self, groups: &mut [AppGroup]) {
+		if self.pins.is_empty() {
+			return;
+		}
+
+		for group in groups.iter_mut() {
+			group.procs.sort_by_key(|proc| self.pin_rank(&PinTarget::Pid(proc.pid)).unwrap_or(usize::MAX));
+		}
+
+		groups.sort_by_key(|group| {
+			let own = self.pin_rank(&PinTarget::Group(group.name.clone())).unwrap_or(usize::MAX);
+			let child = group.procs.iter().filter_map(|proc| self.pin_rank(&PinTarget::Pid(proc.pid))).min().unwrap_or(usize::MAX);
+			own.min(child)
+		});
+	}
+
 	/// Returns the limit that is in force for one PID: the instance override if
 	/// there is one, otherwise the limit of its application group.
 	fn effective_state(&self, pid: u32, name: &str) -> Option<&ProcessLimitState> {
@@ -601,12 +652,13 @@ impl DecLimiterApp {
 }
 
 impl eframe::App for DecLimiterApp {
-	fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+	fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+		let ctx = &root.ctx().clone();
 		ctx.request_repaint_after(Duration::from_millis(500));
 
 		// Check for monitor errors
 		if let Some(err) = self.monitor_error.lock().unwrap().as_ref() {
-			egui::CentralPanel::default().show(ctx, |ui| {
+			egui::CentralPanel::default().show(root, |ui| {
 				ui.vertical_centered(|ui| {
 					ui.add_space(100.0);
 					ui.heading(egui::RichText::new("Monitor Error").color(theme::BLOCKED).size(24.0));
@@ -631,8 +683,10 @@ impl eframe::App for DecLimiterApp {
 			if self.selection == Some(Selection::Process(*pid)) {
 				self.selection = None;
 			}
+			self.pins.retain(|pin| pin != &PinTarget::Pid(*pid));
 		}
-		if !gone.is_empty() {
+		let had_exits = !gone.is_empty();
+		if had_exits {
 			let dead: HashSet<u32> = gone.into_iter().collect();
 			stats.retain(|proc| !dead.contains(&proc.pid));
 		}
@@ -646,6 +700,15 @@ impl eframe::App for DecLimiterApp {
 		}
 		if limits_changed {
 			self.apply_limits();
+		}
+
+		// A pinned application keeps its pin while any instance still runs.
+		if had_exits {
+			let live: HashSet<String> = self.known_pids.values().cloned().collect();
+			self.pins.retain(|pin| match pin {
+				PinTarget::Group(name) => live.contains(name),
+				PinTarget::Pid(_) => true,
+			});
 		}
 
 		// Filter by search query. The query matches the name, the PID, or the
@@ -678,6 +741,9 @@ impl eframe::App for DecLimiterApp {
 			self.frozen_order = None;
 		}
 
+		// Pins hold above the sort and above the frozen order.
+		self.apply_pins(&mut groups);
+
 		let instance_count: usize = groups.iter().map(|g| g.procs.len()).sum();
 
 		// Flatten the groups into the lines the table draws.
@@ -694,9 +760,10 @@ impl eframe::App for DecLimiterApp {
 		let mut clicked_column: Option<SortColumn> = None;
 		let mut new_selection = self.selection.clone();
 		let mut toggle_group: Option<String> = None;
+		let mut toggle_pin: Option<PinTarget> = None;
 
 		// -- Top panel --
-		egui::TopBottomPanel::top("header").frame(egui::Frame::none().fill(theme::BG_HEADER).inner_margin(egui::Margin::symmetric(10.0, 6.0))).show(ctx, |ui| {
+		egui::Panel::top("header").frame(egui::Frame::NONE.fill(theme::BG_HEADER).inner_margin(egui::Margin::symmetric(10, 6))).show(root, |ui| {
 			ui.horizontal(|ui| {
 				ui.label(egui::RichText::new("DecLimiter").strong().size(16.0).color(theme::TEXT_STRONG));
 				ui.add_space(4.0);
@@ -722,7 +789,7 @@ impl eframe::App for DecLimiterApp {
 					egui::TextEdit::singleline(&mut self.search_query)
 						.desired_width(field_width)
 						.font(egui::FontId::proportional(14.0))
-						.margin(egui::Margin { left: 6.0, right: 24.0, top: 5.0, bottom: 5.0 })
+						.margin(egui::Margin { left: 6, right: 24, top: 5, bottom: 5 })
 						.hint_text(egui::RichText::new("Name, PID, or publisher").color(theme::HINT)),
 				);
 				// The clear control sits at the right end of the field, as in
@@ -749,7 +816,7 @@ impl eframe::App for DecLimiterApp {
 		});
 
 		// -- Bottom status bar --
-		egui::TopBottomPanel::bottom("status").frame(egui::Frame::none().fill(theme::BG_HEADER).inner_margin(egui::Margin::symmetric(10.0, 5.0))).show(ctx, |ui| {
+		egui::Panel::bottom("status").frame(egui::Frame::NONE.fill(theme::BG_HEADER).inner_margin(egui::Margin::symmetric(10, 5))).show(root, |ui| {
 			ui.horizontal(|ui| {
 				ui.label(egui::RichText::new("Total").color(theme::TEXT_WEAK));
 				ui.separator();
@@ -771,7 +838,7 @@ impl eframe::App for DecLimiterApp {
 		let mut save_needed = false;
 		{
 			let selection = self.selection.clone();
-			egui::SidePanel::right("details").frame(egui::Frame::none().fill(theme::BG_WINDOW).inner_margin(egui::Margin::same(10.0))).resizable(false).exact_width(320.0).show(ctx, |ui| {
+			egui::Panel::right("details").frame(egui::Frame::NONE.fill(theme::BG_WINDOW).inner_margin(egui::Margin::same(10))).resizable(false).exact_size(320.0).show(root, |ui| {
 				ui.set_width(ui.available_width());
 
 				// The close control sits in the corner of the panel and
@@ -869,8 +936,10 @@ impl eframe::App for DecLimiterApp {
 		let system_flags = self.pid_states.get(&SYSTEM_PID).map(LimitFlags::of).unwrap_or_default();
 		let group_flags: Vec<LimitFlags> = groups.iter().map(|g| self.flags_for_group(g)).collect();
 		let child_flags: Vec<Vec<LimitFlags>> = groups.iter().map(|g| g.procs.iter().map(|p| self.flags_for_pid(p.pid, &g.name)).collect()).collect();
+		let group_pinned: Vec<bool> = groups.iter().map(|g| self.is_pinned(&PinTarget::Group(g.name.clone()))).collect();
+		let child_pinned: Vec<Vec<bool>> = groups.iter().map(|g| g.procs.iter().map(|p| self.is_pinned(&PinTarget::Pid(p.pid))).collect()).collect();
 
-		egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG_TABLE)).show(ctx, |ui| {
+		egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG_TABLE)).show(root, |ui| {
 			ui.style_mut().interaction.selectable_labels = false;
 			let available_height = ui.available_height();
 
@@ -935,6 +1004,12 @@ impl eframe::App for DecLimiterApp {
 							}
 						};
 
+						let (pin_target, is_pinned) = match line {
+							VisibleRow::System => (None, false),
+							VisibleRow::Group(gi) => (Some(PinTarget::Group(groups[*gi].name.clone())), group_pinned[*gi]),
+							VisibleRow::Child(gi, ci) => (Some(PinTarget::Pid(groups[*gi].procs[*ci].pid)), child_pinned[*gi][*ci]),
+						};
+
 						// Group rows show the sum of the whole application.
 						let (dl_speed, ul_speed) = match line {
 							VisibleRow::Group(gi) => (groups[*gi].download_speed, groups[*gi].upload_speed),
@@ -983,6 +1058,10 @@ impl eframe::App for DecLimiterApp {
 							}
 							ui.label(text);
 
+							if is_pinned {
+								draw_pin_mark(ui, theme::ACCENT_LIGHT);
+							}
+
 							if flags.dl_blocked || flags.dl_active {
 								let color = if flags.dl_blocked { theme::BLOCKED } else { theme::LIMITED };
 								ui.label(egui::RichText::new("DL").small().strong().color(color));
@@ -1016,6 +1095,16 @@ impl eframe::App for DecLimiterApp {
 							}
 						});
 
+						if let Some(target) = pin_target {
+							row.response().context_menu(|ui| {
+								let label = if is_pinned { "Unpin" } else { "Pin to top" };
+								if ui.button(label).clicked() {
+									toggle_pin = Some(target.clone());
+									ui.close();
+								}
+							});
+						}
+
 						if row.response().clicked() && !expander_clicked {
 							let clicked = match line {
 								VisibleRow::System => Selection::System,
@@ -1036,6 +1125,10 @@ impl eframe::App for DecLimiterApp {
 				self.sort_column = col;
 				self.sort_ascending = false;
 			}
+		}
+
+		if let Some(target) = toggle_pin {
+			self.toggle_pin(target);
 		}
 
 		if let Some(name) = toggle_group {
@@ -1072,6 +1165,20 @@ fn draw_expander(ui: &mut egui::Ui, open: bool) -> egui::Response {
 	};
 
 	ui.painter().add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+	response
+}
+
+/// Draws the pin mark of a row that the user holds at the top of the table.
+/// The mark is painted, not a glyph, because the default fonts do not have a
+/// pin character.
+fn draw_pin_mark(ui: &mut egui::Ui, color: egui::Color32) -> egui::Response {
+	let (rect, response) = ui.allocate_exact_size(egui::vec2(10.0, ROW_HEIGHT), egui::Sense::hover());
+	let center = rect.center();
+	let painter = ui.painter();
+
+	// Head of the pin, then the point below it.
+	painter.circle_filled(center + egui::vec2(0.0, -2.0), 3.2, color);
+	painter.line_segment([center + egui::vec2(0.0, 1.0), center + egui::vec2(0.0, 5.0)], egui::Stroke::new(1.6, color));
 	response
 }
 
@@ -1135,7 +1242,7 @@ fn detail_header(ui: &mut egui::Ui, title: &str, subtitle: &str, traffic: &Proce
 	ui.label(egui::RichText::new(subtitle).color(theme::TEXT_WEAK));
 	ui.add_space(8.0);
 
-	egui::Frame::none().fill(theme::BG_TABLE).stroke(egui::Stroke::new(1.0, theme::BORDER)).inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
+	egui::Frame::NONE.fill(theme::BG_TABLE).stroke(egui::Stroke::new(1.0, theme::BORDER)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
 		ui.set_width(ui.available_width());
 		stat_line(ui, "Download", format_speed(traffic.download_speed), theme::DOWNLOAD);
 		stat_line(ui, "Upload", format_speed(traffic.upload_speed), theme::UPLOAD);
