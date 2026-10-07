@@ -840,11 +840,12 @@ impl eframe::App for DecLimiterApp {
 			let selection = self.selection.clone();
 			egui::Panel::right("details").frame(egui::Frame::NONE.fill(theme::BG_WINDOW).inner_margin(egui::Margin::same(10))).resizable(false).exact_size(320.0).show(root, |ui| {
 				ui.set_width(ui.available_width());
+				enlarge_detail_style(ui);
 
 				// The close control sits in the corner of the panel and
 				// does not take a line of its own.
 				if selection.is_some() {
-					let rect = egui::Rect::from_min_size(egui::pos2(ui.max_rect().right() - 20.0, ui.max_rect().top()), egui::vec2(20.0, 20.0));
+					let rect = egui::Rect::from_min_size(egui::pos2(ui.max_rect().right() - 26.0, ui.max_rect().top()), egui::vec2(26.0, 26.0));
 					if draw_close_button(ui, rect).clicked() {
 						new_selection = None;
 					}
@@ -1207,8 +1208,8 @@ fn draw_close_button(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
 		ui.painter().rect_filled(rect, 0.0, theme::BG_HEADER);
 	}
 	let center = rect.center();
-	let arm = 5.0;
-	let stroke = egui::Stroke::new(1.6, color);
+	let arm = 6.5;
+	let stroke = egui::Stroke::new(1.8, color);
 	ui.painter().line_segment([center + egui::vec2(-arm, -arm), center + egui::vec2(arm, arm)], stroke);
 	ui.painter().line_segment([center + egui::vec2(arm, -arm), center + egui::vec2(-arm, arm)], stroke);
 	response.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1230,7 +1231,7 @@ fn draw_clear_button(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
 /// Shown in the detail panel while no row is selected, so the panel keeps its
 /// place on screen instead of appearing over the table.
 fn detail_placeholder(ui: &mut egui::Ui) {
-	ui.label(egui::RichText::new("Limits").strong().size(17.0).color(theme::TEXT_STRONG));
+	ui.label(egui::RichText::new("Limits").strong().size(21.0).color(theme::TEXT_STRONG));
 	ui.label(egui::RichText::new("No selection").color(theme::TEXT_WEAK));
 	ui.add_space(10.0);
 	ui.label(egui::RichText::new("Select a row in the table to see its traffic and to set a block or a speed limit.").color(theme::TEXT_WEAK));
@@ -1238,7 +1239,7 @@ fn detail_placeholder(ui: &mut egui::Ui) {
 
 /// The title block at the top of the detail panel.
 fn detail_header(ui: &mut egui::Ui, title: &str, subtitle: &str, traffic: &ProcessTraffic) {
-	ui.label(egui::RichText::new(title).strong().size(17.0).color(theme::TEXT_STRONG));
+	ui.label(egui::RichText::new(title).strong().size(21.0).color(theme::TEXT_STRONG));
 	ui.label(egui::RichText::new(subtitle).color(theme::TEXT_WEAK));
 	ui.add_space(8.0);
 
@@ -1270,8 +1271,9 @@ fn limit_editor(ui: &mut egui::Ui, id: &str, state: &mut ProcessLimitState) {
 	ui.horizontal(|ui| {
 		ui.checkbox(&mut state.dl_enabled, "Limit to");
 		ui.add_enabled_ui(state.dl_enabled && !state.dl_blocked, |ui| {
-			ui.add(egui::DragValue::new(&mut state.dl_value).speed(0.0).range(0.0..=999999.0).max_decimals(1).update_while_editing(false));
-			egui::ComboBox::from_id_salt(("dl_unit", id)).selected_text(state.dl_unit.label()).width(60.0).show_ui(ui, |ui| {
+			number_field(ui, egui::Id::new(("dl_value", id)), &mut state.dl_value);
+			egui::ComboBox::from_id_salt(("dl_unit", id)).selected_text(state.dl_unit.label()).width(76.0).show_ui(ui, |ui| {
+				enlarge_detail_style(ui);
 				for unit in SpeedUnit::ALL {
 					ui.selectable_value(&mut state.dl_unit, unit, unit.label());
 				}
@@ -1287,8 +1289,9 @@ fn limit_editor(ui: &mut egui::Ui, id: &str, state: &mut ProcessLimitState) {
 	ui.horizontal(|ui| {
 		ui.checkbox(&mut state.ul_enabled, "Limit to");
 		ui.add_enabled_ui(state.ul_enabled && !state.ul_blocked, |ui| {
-			ui.add(egui::DragValue::new(&mut state.ul_value).speed(0.0).range(0.0..=999999.0).max_decimals(1).update_while_editing(false));
-			egui::ComboBox::from_id_salt(("ul_unit", id)).selected_text(state.ul_unit.label()).width(60.0).show_ui(ui, |ui| {
+			number_field(ui, egui::Id::new(("ul_value", id)), &mut state.ul_value);
+			egui::ComboBox::from_id_salt(("ul_unit", id)).selected_text(state.ul_unit.label()).width(76.0).show_ui(ui, |ui| {
+				enlarge_detail_style(ui);
 				for unit in SpeedUnit::ALL {
 					ui.selectable_value(&mut state.ul_unit, unit, unit.label());
 				}
@@ -1297,12 +1300,51 @@ fn limit_editor(ui: &mut egui::Ui, id: &str, state: &mut ProcessLimitState) {
 	});
 }
 
+/// A text field for a speed value. The value changes only when the field
+/// loses focus, so a limit is not applied while the user types.
+fn number_field(ui: &mut egui::Ui, id: egui::Id, value: &mut f64) {
+	let buffer_id = id.with("buffer");
+	let mut text = ui.data(|d| d.get_temp::<String>(buffer_id)).unwrap_or_else(|| format_limit_value(*value));
+	let response = ui.add(egui::TextEdit::singleline(&mut text).id(id).desired_width(80.0));
+
+	if response.lost_focus() {
+		if let Ok(parsed) = text.trim().parse::<f64>() {
+			if parsed.is_finite() {
+				*value = (parsed.clamp(0.0, 999999.0) * 10.0).round() / 10.0;
+			}
+		}
+	}
+
+	if response.has_focus() {
+		ui.data_mut(|d| d.insert_temp(buffer_id, text));
+	} else {
+		ui.data_mut(|d| d.remove::<String>(buffer_id));
+	}
+}
+
+fn format_limit_value(value: f64) -> String {
+	if value.fract() == 0.0 { format!("{value:.0}") } else { format!("{value:.1}") }
+}
+
+/// Makes the text and the controls of the detail panel larger than those of
+/// the table.
+fn enlarge_detail_style(ui: &mut egui::Ui) {
+	let style = ui.style_mut();
+	style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+	style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(16.0));
+	style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(15.0));
+	style.spacing.button_padding = egui::vec2(10.0, 5.0);
+	style.spacing.interact_size.y = 28.0;
+	style.spacing.icon_width = 18.0;
+	style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+}
+
 /// A colored bar and a caption that start a section of the detail panel.
 fn section_title(ui: &mut egui::Ui, title: &str, color: egui::Color32) {
 	ui.horizontal(|ui| {
-		let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+		let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 16.0), egui::Sense::hover());
 		ui.painter().rect_filled(rect, 0.0, color);
-		ui.label(egui::RichText::new(title.to_uppercase()).strong().size(13.0).color(color));
+		ui.label(egui::RichText::new(title.to_uppercase()).strong().size(15.0).color(color));
 	});
 	ui.add_space(4.0);
 }
