@@ -424,6 +424,12 @@ impl DecLimiter {
 
 		tokio::spawn(async move {
 			debug!("Starting speed calculator...");
+			// The time of the last sample of each counter set. The sleep and the
+			// work in this loop make each interval longer than the nominal
+			// value, thus the speed must use the measured time.
+			let mut last_traffic_sample = Instant::now();
+			let mut last_totals_sample = Instant::now();
+
 			loop {
 				sleep(SPEED_UPDATE_INTERVAL).await;
 
@@ -431,9 +437,11 @@ impl DecLimiter {
 
 				if let Ok(mut lock) = traffic.write() {
 					let now = Instant::now();
+					let elapsed = now.duration_since(last_traffic_sample).as_secs_f64();
+					last_traffic_sample = now;
 					lock.retain(|&pid, inner| {
-						inner.download_speed = (inner.download_bytes - inner.prev_download_bytes) as f64;
-						inner.upload_speed = (inner.upload_bytes - inner.prev_upload_bytes) as f64;
+						inner.download_speed = (inner.download_bytes - inner.prev_download_bytes) as f64 / elapsed;
+						inner.upload_speed = (inner.upload_bytes - inner.prev_upload_bytes) as f64 / elapsed;
 						inner.prev_download_bytes = inner.download_bytes;
 						inner.prev_upload_bytes = inner.upload_bytes;
 
@@ -452,8 +460,11 @@ impl DecLimiter {
 				}
 
 				if let Ok(mut t) = totals.write() {
-					t.download_speed = (t.download_bytes - t.prev_download_bytes) as f64;
-					t.upload_speed = (t.upload_bytes - t.prev_upload_bytes) as f64;
+					let now = Instant::now();
+					let elapsed = now.duration_since(last_totals_sample).as_secs_f64();
+					last_totals_sample = now;
+					t.download_speed = (t.download_bytes - t.prev_download_bytes) as f64 / elapsed;
+					t.upload_speed = (t.upload_bytes - t.prev_upload_bytes) as f64 / elapsed;
 					t.prev_download_bytes = t.download_bytes;
 					t.prev_upload_bytes = t.upload_bytes;
 				}
