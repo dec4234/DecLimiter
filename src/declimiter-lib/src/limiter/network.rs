@@ -1,15 +1,28 @@
 use derive_new::new;
 use etherparse::{InternetSlice, SlicedPacket, TransportSlice};
-use std::net::{IpAddr, Ipv4Addr};
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
+use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::NetworkManagement::IpHelper::{
-	GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCPTABLE_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
+	GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
+	MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
 };
-use windows::Win32::Networking::WinSock::AF_INET;
+use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
-/// The destination of a packet. Used to match connections to PIDs.
+/// The transport protocol of a flow. TCP and UDP have separate port spaces,
+/// thus the same local address and port can belong to two processes.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum FlowProtocol {
+	Tcp,
+	Udp,
+}
+
+/// The local end of a packet. Used to match connections to PIDs.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, new, Eq)]
 pub struct FlowAddress {
+	pub protocol: FlowProtocol,
 	pub ip: IpAddr,
 	pub port: u16,
 }
@@ -49,11 +62,11 @@ fn extract_ip(sliced: &SlicedPacket, use_source: bool) -> Option<IpAddr> {
 	}
 }
 
-/// Extract the port from a raw IP packet's transport header.
-fn extract_port(sliced: &SlicedPacket, use_source: bool) -> Option<u16> {
+/// Extract the protocol and the port from a raw IP packet's transport header.
+fn extract_port(sliced: &SlicedPacket, use_source: bool) -> Option<(FlowProtocol, u16)> {
 	match sliced.transport.as_ref()? {
-		TransportSlice::Tcp(tcp) => Some(if use_source { tcp.source_port() } else { tcp.destination_port() }),
-		TransportSlice::Udp(udp) => Some(if use_source { udp.source_port() } else { udp.destination_port() }),
+		TransportSlice::Tcp(tcp) => Some((FlowProtocol::Tcp, if use_source { tcp.source_port() } else { tcp.destination_port() })),
+		TransportSlice::Udp(udp) => Some((FlowProtocol::Udp, if use_source { udp.source_port() } else { udp.destination_port() })),
 		_ => None,
 	}
 }
@@ -62,8 +75,8 @@ fn extract_port(sliced: &SlicedPacket, use_source: bool) -> Option<u16> {
 fn parse_flow(packet: &[u8], use_source: bool) -> Option<FlowAddress> {
 	let sliced = SlicedPacket::from_ip(packet).ok()?;
 	let ip = extract_ip(&sliced, use_source)?;
-	let port = extract_port(&sliced, use_source)?;
-	Some(FlowAddress::new(ip, port))
+	let (protocol, port) = extract_port(&sliced, use_source)?;
+	Some(FlowAddress::new(protocol, ip, port))
 }
 
 /// Parse the flow address (destination IP and port) from a raw IP packet.
@@ -75,6 +88,22 @@ pub fn parse_flow_dest(packet: &[u8]) -> Option<FlowAddress> {
 /// Used for matching outbound packets to their originating process.
 pub fn parse_flow_source(packet: &[u8]) -> Option<FlowAddress> {
 	parse_flow(packet, true)
+}
+
+/// Find the PID that owns a flow.
+///
+/// A socket bound to INADDR_ANY (0.0.0.0 / ::) appears in the connection table
+/// with a wildcard IP, but its packets carry the specific IP of the machine.
+/// Thus, if there is no exact match, try the wildcard address of the same
+/// family. A dual-stack IPv6 socket bound to :: also receives IPv4 packets, so
+/// an IPv4 flow tries the IPv6 wildcard last.
+pub fn lookup_pid(map: &HashMap<FlowAddress, FlowEntry>, flow: &FlowAddress) -> Option<u32> {
+	let wildcard = |ip: IpAddr| map.get(&FlowAddress::new(flow.protocol, ip, flow.port)).map(|e| e.pid);
+
+	map.get(flow).map(|e| e.pid).or_else(|| match flow.ip {
+		IpAddr::V4(_) => wildcard(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).or_else(|| wildcard(IpAddr::V6(Ipv6Addr::UNSPECIFIED))),
+		IpAddr::V6(_) => wildcard(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -92,65 +121,164 @@ fn port_from_raw(raw: u32) -> u16 {
 	u16::from_be((raw & 0xFFFF) as u16)
 }
 
-/// Query the Windows TCP and UDP connection tables to get (local_ip, local_port, pid) mappings.
-pub fn get_pid_port_mappings() -> Vec<(IpAddr, u16, u32)> {
+/// Convert a raw IPv6 address to an IpAddr. An IPv4-mapped address
+/// (::ffff:a.b.c.d) becomes an IPv4 address, because the packets of such a
+/// connection are IPv4 packets.
+fn ipv6_from_raw(raw: [u8; 16]) -> IpAddr {
+	let addr = Ipv6Addr::from(raw);
+	addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4)
+}
+
+/// Query the Windows TCP and UDP connection tables (IPv4 and IPv6) to get
+/// (local flow address, pid) mappings.
+pub fn get_pid_port_mappings() -> Vec<(FlowAddress, u32)> {
 	let mut result = Vec::new();
 	query_tcp_table(&mut result);
+	query_tcp6_table(&mut result);
 	query_udp_table(&mut result);
+	query_udp6_table(&mut result);
 	result
 }
 
-fn query_tcp_table(result: &mut Vec<(IpAddr, u16, u32)>) {
+/// Read a connection table into a buffer. `query` gets the buffer pointer and
+/// the buffer size, and returns the Win32 status.
+///
+/// The buffer holds u32 values so that it has the alignment that the table
+/// structures need.
+fn read_table(query: impl Fn(Option<*mut c_void>, &mut u32) -> u32) -> Option<Vec<u32>> {
 	let mut size: u32 = 0;
+	query(None, &mut size);
 
-	// Safety: First call with null buffer to get required size. Second call reads into
-	// an appropriately-sized buffer. The MIB_TCPTABLE_OWNER_PID layout is well-defined
-	// by the Windows SDK and the pointer arithmetic stays within the buffer bounds
-	// guarded by dwNumEntries.
-	unsafe {
-		let _ = GetExtendedTcpTable(None, &mut size, false.into(), AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0);
-
+	// The table can grow between the size query and the read, so try again
+	// with the new size if the buffer was too small.
+	for _ in 0..3 {
 		if size == 0 {
-			return;
+			return None;
 		}
 
-		let mut buffer = vec![0u8; size as usize];
-		let ret = GetExtendedTcpTable(Some(buffer.as_mut_ptr() as *mut _), &mut size, false.into(), AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0);
+		let mut buffer = vec![0u32; (size as usize).div_ceil(size_of::<u32>())];
+		let ret = query(Some(buffer.as_mut_ptr() as *mut c_void), &mut size);
 
-		if ret != 0 {
-			return;
+		if ret == 0 {
+			return Some(buffer);
 		}
+		if ret != ERROR_INSUFFICIENT_BUFFER.0 {
+			return None;
+		}
+	}
 
-		let table = &*(buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
-		for i in 0..table.dwNumEntries as usize {
-			let row = &*table.table.as_ptr().add(i);
-			result.push((ipv4_from_raw(row.dwLocalAddr), port_from_raw(row.dwLocalPort), row.dwOwningPid));
+	None
+}
+
+fn query_tcp_table(result: &mut Vec<(FlowAddress, u32)>) {
+	// Safety: read_table gives a buffer that Windows filled with a
+	// MIB_TCPTABLE_OWNER_PID. The layout is well-defined by the Windows SDK and
+	// the row slice stays within the buffer bounds guarded by dwNumEntries.
+	unsafe {
+		let Some(buffer) = read_table(|table, size| GetExtendedTcpTable(table, size, false.into(), AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0)) else {
+			return;
+		};
+
+		let table = buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
+		let rows = std::slice::from_raw_parts(&raw const (*table).table as *const MIB_TCPROW_OWNER_PID, (*table).dwNumEntries as usize);
+		for row in rows {
+			result.push((FlowAddress::new(FlowProtocol::Tcp, ipv4_from_raw(row.dwLocalAddr), port_from_raw(row.dwLocalPort)), row.dwOwningPid));
 		}
 	}
 }
 
-fn query_udp_table(result: &mut Vec<(IpAddr, u16, u32)>) {
-	let mut size: u32 = 0;
-
-	// Safety: Same pattern as query_tcp_table — two-pass size query then read.
+fn query_tcp6_table(result: &mut Vec<(FlowAddress, u32)>) {
+	// Safety: Same pattern as query_tcp_table, with the IPv6 table layout.
 	unsafe {
-		let _ = GetExtendedUdpTable(None, &mut size, false.into(), AF_INET.0 as u32, UDP_TABLE_OWNER_PID, 0);
-
-		if size == 0 {
+		let Some(buffer) = read_table(|table, size| GetExtendedTcpTable(table, size, false.into(), AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0)) else {
 			return;
+		};
+
+		let table = buffer.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
+		let rows = std::slice::from_raw_parts(&raw const (*table).table as *const MIB_TCP6ROW_OWNER_PID, (*table).dwNumEntries as usize);
+		for row in rows {
+			result.push((FlowAddress::new(FlowProtocol::Tcp, ipv6_from_raw(row.ucLocalAddr), port_from_raw(row.dwLocalPort)), row.dwOwningPid));
 		}
+	}
+}
 
-		let mut buffer = vec![0u8; size as usize];
-		let ret = GetExtendedUdpTable(Some(buffer.as_mut_ptr() as *mut _), &mut size, false.into(), AF_INET.0 as u32, UDP_TABLE_OWNER_PID, 0);
-
-		if ret != 0 {
+fn query_udp_table(result: &mut Vec<(FlowAddress, u32)>) {
+	// Safety: Same pattern as query_tcp_table, with the UDP table layout.
+	unsafe {
+		let Some(buffer) = read_table(|table, size| GetExtendedUdpTable(table, size, false.into(), AF_INET.0 as u32, UDP_TABLE_OWNER_PID, 0)) else {
 			return;
-		}
+		};
 
-		let table = &*(buffer.as_ptr() as *const MIB_UDPTABLE_OWNER_PID);
-		for i in 0..table.dwNumEntries as usize {
-			let row = &*table.table.as_ptr().add(i);
-			result.push((ipv4_from_raw(row.dwLocalAddr), port_from_raw(row.dwLocalPort), row.dwOwningPid));
+		let table = buffer.as_ptr() as *const MIB_UDPTABLE_OWNER_PID;
+		let rows = std::slice::from_raw_parts(&raw const (*table).table as *const MIB_UDPROW_OWNER_PID, (*table).dwNumEntries as usize);
+		for row in rows {
+			result.push((FlowAddress::new(FlowProtocol::Udp, ipv4_from_raw(row.dwLocalAddr), port_from_raw(row.dwLocalPort)), row.dwOwningPid));
+		}
+	}
+}
+
+fn query_udp6_table(result: &mut Vec<(FlowAddress, u32)>) {
+	// Safety: Same pattern as query_tcp_table, with the IPv6 UDP table layout.
+	unsafe {
+		let Some(buffer) = read_table(|table, size| GetExtendedUdpTable(table, size, false.into(), AF_INET6.0 as u32, UDP_TABLE_OWNER_PID, 0)) else {
+			return;
+		};
+
+		let table = buffer.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID;
+		let rows = std::slice::from_raw_parts(&raw const (*table).table as *const MIB_UDP6ROW_OWNER_PID, (*table).dwNumEntries as usize);
+		for row in rows {
+			result.push((FlowAddress::new(FlowProtocol::Udp, ipv6_from_raw(row.ucLocalAddr), port_from_raw(row.dwLocalPort)), row.dwOwningPid));
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn flow(protocol: FlowProtocol, ip: &str, port: u16) -> FlowAddress {
+		FlowAddress::new(protocol, ip.parse().unwrap(), port)
+	}
+
+	#[test]
+	fn lookup_keeps_tcp_and_udp_apart() {
+		let mut map = HashMap::new();
+		map.insert(flow(FlowProtocol::Tcp, "10.0.0.2", 5000), FlowEntry::new(1));
+		map.insert(flow(FlowProtocol::Udp, "10.0.0.2", 5000), FlowEntry::new(2));
+
+		assert_eq!(lookup_pid(&map, &flow(FlowProtocol::Tcp, "10.0.0.2", 5000)), Some(1));
+		assert_eq!(lookup_pid(&map, &flow(FlowProtocol::Udp, "10.0.0.2", 5000)), Some(2));
+	}
+
+	#[test]
+	fn lookup_uses_wildcards() {
+		let mut map = HashMap::new();
+		map.insert(flow(FlowProtocol::Udp, "0.0.0.0", 53), FlowEntry::new(1));
+		map.insert(flow(FlowProtocol::Udp, "::", 53), FlowEntry::new(2));
+		map.insert(flow(FlowProtocol::Udp, "::", 443), FlowEntry::new(3));
+
+		// The wildcard of the same family has priority.
+		assert_eq!(lookup_pid(&map, &flow(FlowProtocol::Udp, "10.0.0.2", 53)), Some(1));
+		assert_eq!(lookup_pid(&map, &flow(FlowProtocol::Udp, "2001:db8::1", 53)), Some(2));
+		// An IPv4 packet to a dual-stack socket.
+		assert_eq!(lookup_pid(&map, &flow(FlowProtocol::Udp, "10.0.0.2", 443)), Some(3));
+		assert_eq!(lookup_pid(&map, &flow(FlowProtocol::Tcp, "10.0.0.2", 443)), None);
+	}
+
+	#[test]
+	fn ipv4_mapped_address_becomes_ipv4() {
+		let mapped: Ipv6Addr = "::ffff:192.168.1.5".parse().unwrap();
+		assert_eq!(ipv6_from_raw(mapped.octets()), "192.168.1.5".parse::<IpAddr>().unwrap());
+	}
+
+	/// The tables of this machine must have a minimum of one entry for each
+	/// protocol and address family.
+	#[test]
+	fn tables_contain_all_families() {
+		let mappings = get_pid_port_mappings();
+		for protocol in [FlowProtocol::Tcp, FlowProtocol::Udp] {
+			assert!(mappings.iter().any(|(f, _)| f.protocol == protocol && f.ip.is_ipv4()), "no IPv4 {protocol:?} entry");
+			assert!(mappings.iter().any(|(f, _)| f.protocol == protocol && f.ip.is_ipv6()), "no IPv6 {protocol:?} entry");
 		}
 	}
 }

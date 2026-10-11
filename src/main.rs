@@ -45,5 +45,13 @@ fn wait_for_input() {
 #[tokio::test]
 async fn test_limiter() {
     let limiter = declimiter_lib::limiter::DecLimiter::new().unwrap();
-    tokio::try_join!(limiter.start(), limiter.limit_speed_pid(44188, Some(500), None), limiter.garbage_collect_flows(std::time::Duration::from_secs(100))).unwrap();
+    let start = limiter.start();
+    let limit = limiter.limit_speed_pid(44188, Some(500), None);
+    let garbage_collect = limiter.garbage_collect_flows(std::time::Duration::from_secs(100));
+
+    tokio::try_join!(
+        async { start.await.unwrap() },
+        async { limit.await.unwrap() },
+        async { garbage_collect.await.unwrap() },
+    ).unwrap();
 }

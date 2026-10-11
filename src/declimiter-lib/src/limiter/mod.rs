@@ -11,7 +11,6 @@ use crate::util::get_process_name;
 use log::{debug, error, trace};
 use ndisapi::{DirectionFlags, IntermediateBuffer, Ndisapi};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -141,19 +140,7 @@ impl DecLimiter {
 
 	/// Check if the given PID matches the PID associated with the given flow address.
 	fn pid_matches_blocking(map: &Arc<RwLock<HashMap<FlowAddress, FlowEntry>>>, flow: &FlowAddress, pid: u32) -> bool {
-		let map_lock = map.blocking_read();
-		if let Some(entry) = map_lock.get(flow) {
-			return entry.pid == pid;
-		}
-		// Fallback: UDP sockets bound to INADDR_ANY (0.0.0.0 / ::) appear in
-		// the connection table with a wildcard IP, but inbound packets carry the
-		// machine's specific IP.  Try matching by port alone against those entries.
-		let unspec = match flow.ip {
-			IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-			IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-		};
-		let wildcard = FlowAddress::new(unspec, flow.port);
-		map_lock.get(&wildcard).map_or(false, |entry| entry.pid == pid)
+		network::lookup_pid(&map.blocking_read(), flow) == Some(pid)
 	}
 
 	/// Record bytes in the total and per-PID traffic counters.
@@ -214,8 +201,7 @@ impl DecLimiter {
 
 				{
 					let mut map_lock = map.write().await;
-					for (ip, port, pid) in mappings {
-						let flow = FlowAddress::new(ip, port);
+					for (flow, pid) in mappings {
 						map_lock
 							.entry(flow)
 							.and_modify(|e| {
@@ -324,18 +310,7 @@ impl DecLimiter {
 
 							let flow = if is_outbound { parse_flow_source(ip_data) } else { parse_flow_dest(ip_data) };
 
-							let pid = flow.and_then(|f| {
-								let map = flow_map.blocking_read();
-								map.get(&f).map(|e| e.pid).or_else(|| {
-									// Fallback for sockets bound to INADDR_ANY / IN6ADDR_ANY.
-									let unspec = match f.ip {
-										IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-										IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-									};
-									let wildcard = FlowAddress::new(unspec, f.port);
-									map.get(&wildcard).map(|e| e.pid)
-								})
-							});
+							let pid = flow.and_then(|f| network::lookup_pid(&flow_map.blocking_read(), &f));
 							resolved_pid = pid;
 
 							// Apply limits: system-wide (PID 0) first, then per-PID
