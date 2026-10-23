@@ -1271,7 +1271,7 @@ fn limit_editor(ui: &mut egui::Ui, id: &str, state: &mut ProcessLimitState) {
 	ui.horizontal(|ui| {
 		ui.checkbox(&mut state.dl_enabled, "Limit to");
 		ui.add_enabled_ui(state.dl_enabled && !state.dl_blocked, |ui| {
-			number_field(ui, egui::Id::new(("dl_value", id)), &mut state.dl_value);
+			number_field(ui, egui::Id::unique(("dl_value", id)), &mut state.dl_value);
 			egui::ComboBox::from_id_salt(("dl_unit", id)).selected_text(state.dl_unit.label()).width(76.0).show_ui(ui, |ui| {
 				enlarge_detail_style(ui);
 				for unit in SpeedUnit::ALL {
@@ -1289,7 +1289,7 @@ fn limit_editor(ui: &mut egui::Ui, id: &str, state: &mut ProcessLimitState) {
 	ui.horizontal(|ui| {
 		ui.checkbox(&mut state.ul_enabled, "Limit to");
 		ui.add_enabled_ui(state.ul_enabled && !state.ul_blocked, |ui| {
-			number_field(ui, egui::Id::new(("ul_value", id)), &mut state.ul_value);
+			number_field(ui, egui::Id::unique(("ul_value", id)), &mut state.ul_value);
 			egui::ComboBox::from_id_salt(("ul_unit", id)).selected_text(state.ul_unit.label()).width(76.0).show_ui(ui, |ui| {
 				enlarge_detail_style(ui);
 				for unit in SpeedUnit::ALL {
