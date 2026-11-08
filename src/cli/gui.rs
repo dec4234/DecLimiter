@@ -1393,3 +1393,501 @@ fn speed_color(bytes_per_sec: f64, active: egui::Color32) -> egui::Color32 {
 		active
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn proc(pid: u32, name: &str, download_speed: f64, upload_speed: f64) -> ProcessTraffic {
+		ProcessTraffic {
+			pid,
+			name: name.to_string(),
+			download_bytes: pid as u64 * 10,
+			upload_bytes: pid as u64,
+			download_speed,
+			upload_speed,
+		}
+	}
+
+	fn app() -> DecLimiterApp {
+		DecLimiterApp {
+			stats: Arc::new(Mutex::new(Vec::new())),
+			system_totals: Arc::new(Mutex::new(proc(0, "System", 0.0, 0.0))),
+			monitor_error: Arc::new(Mutex::new(None)),
+			limits_handle: Arc::new(Mutex::new(None)),
+			exited: Arc::new(Mutex::new(Vec::new())),
+			group_states: HashMap::new(),
+			pid_states: HashMap::new(),
+			expanded: HashSet::new(),
+			sort_column: SortColumn::DownloadSpeed,
+			sort_ascending: false,
+			search_query: String::new(),
+			selection: None,
+			known_pids: HashMap::new(),
+			frozen_order: None,
+			icons: IconCache::new(),
+			publishers: PublisherCache::new(),
+			pins: Vec::new(),
+		}
+	}
+
+	/// The sample traffic: three applications, one of them with three instances.
+	fn sample_stats() -> Vec<ProcessTraffic> {
+		vec![
+			proc(30, "chrome.exe", 100.0, 5.0),
+			proc(10, "Zoom.exe", 50.0, 500.0),
+			proc(20, "chrome.exe", 300.0, 1.0),
+			proc(40, "apex.exe", 10.0, 50.0),
+			proc(25, "chrome.exe", 0.0, 2.0),
+		]
+	}
+
+	fn group_names(groups: &[AppGroup]) -> Vec<&str> {
+		groups.iter().map(|g| g.name.as_str()).collect()
+	}
+
+	fn pids(group: &AppGroup) -> Vec<u32> {
+		group.procs.iter().map(|p| p.pid).collect()
+	}
+
+	fn limited(dl_kbps: f64, ul_kbps: f64) -> ProcessLimitState {
+		ProcessLimitState {
+			dl_enabled: dl_kbps > 0.0,
+			dl_value: dl_kbps,
+			ul_enabled: ul_kbps > 0.0,
+			ul_value: ul_kbps,
+			..Default::default()
+		}
+	}
+
+	// -- SpeedUnit ----------------------------------------------------------
+
+	#[test]
+	fn speed_unit_names_and_multipliers() {
+		let expected = [(SpeedUnit::Bps, "B/s", "Bps", 1.0), (SpeedUnit::KBps, "KB/s", "KBps", 1024.0), (SpeedUnit::MBps, "MB/s", "MBps", 1048576.0), (SpeedUnit::GBps, "GB/s", "GBps", 1073741824.0)];
+		assert_eq!(SpeedUnit::ALL.len(), expected.len());
+		for (unit, label, key, multiplier) in expected {
+			assert_eq!(unit.label(), label);
+			assert_eq!(unit.as_str(), key);
+			assert_eq!(unit.multiplier(), multiplier);
+		}
+	}
+
+	#[test]
+	fn speed_unit_survives_a_round_trip_through_text() {
+		for unit in SpeedUnit::ALL {
+			assert!(SpeedUnit::from_str(unit.as_str()) == unit);
+		}
+	}
+
+	#[test]
+	fn unknown_speed_unit_text_gives_kilobytes() {
+		for text in ["", "kbps", "TBps", "B/s", "garbage"] {
+			assert!(SpeedUnit::from_str(text) == SpeedUnit::KBps, "{text:?}");
+		}
+	}
+
+	// -- ProcessLimitState ----------------------------------------------------
+
+	#[test]
+	fn default_state_has_no_limit() {
+		let state = ProcessLimitState::default();
+		assert_eq!(state.download_byterate(), None);
+		assert_eq!(state.upload_byterate(), None);
+		assert!(!state.dl_active());
+		assert!(!state.ul_active());
+		assert!(!state.has_any_setting());
+	}
+
+	#[test]
+	fn enabled_limit_converts_to_bytes_per_second() {
+		let state = ProcessLimitState {
+			dl_enabled: true,
+			dl_value: 1.5,
+			dl_unit: SpeedUnit::MBps,
+			ul_enabled: true,
+			ul_value: 300.0,
+			ul_unit: SpeedUnit::Bps,
+			..Default::default()
+		};
+		assert_eq!(state.download_byterate(), Some(1_572_864));
+		assert_eq!(state.upload_byterate(), Some(300));
+		assert!(state.dl_active());
+		assert!(state.ul_active());
+	}
+
+	#[test]
+	fn a_value_without_the_check_box_is_no_limit() {
+		let state = ProcessLimitState {
+			dl_value: 100.0,
+			ul_value: 100.0,
+			..Default::default()
+		};
+		assert_eq!(state.download_byterate(), None);
+		assert_eq!(state.upload_byterate(), None);
+		assert!(!state.dl_active());
+		// The value still counts as a setting to save.
+		assert!(state.has_any_setting());
+	}
+
+	#[test]
+	fn an_enabled_limit_of_zero_or_less_is_no_limit() {
+		for value in [0.0, -5.0] {
+			let state = ProcessLimitState {
+				dl_enabled: true,
+				dl_value: value,
+				ul_enabled: true,
+				ul_value: value,
+				..Default::default()
+			};
+			assert_eq!(state.download_byterate(), None, "value {value}");
+			assert_eq!(state.upload_byterate(), None, "value {value}");
+			assert!(!state.dl_active());
+			assert!(!state.ul_active());
+		}
+	}
+
+	#[test]
+	fn block_overrides_the_limit_with_rate_zero() {
+		let state = ProcessLimitState {
+			dl_enabled: true,
+			dl_value: 500.0,
+			dl_blocked: true,
+			ul_blocked: true,
+			..Default::default()
+		};
+		assert_eq!(state.download_byterate(), Some(0));
+		assert_eq!(state.upload_byterate(), Some(0));
+		assert!(state.dl_active());
+		assert!(state.ul_active());
+	}
+
+	#[test]
+	fn has_any_setting_sees_each_field() {
+		let cases = [
+			ProcessLimitState { dl_enabled: true, ..Default::default() },
+			ProcessLimitState { dl_blocked: true, ..Default::default() },
+			ProcessLimitState { dl_value: 1.0, ..Default::default() },
+			ProcessLimitState { ul_enabled: true, ..Default::default() },
+			ProcessLimitState { ul_blocked: true, ..Default::default() },
+			ProcessLimitState { ul_value: 1.0, ..Default::default() },
+		];
+		for state in cases {
+			assert!(state.has_any_setting());
+		}
+		// A unit alone is not a setting.
+		assert!(!ProcessLimitState { dl_unit: SpeedUnit::GBps, ..Default::default() }.has_any_setting());
+	}
+
+	#[test]
+	fn state_survives_a_round_trip_through_process_config() {
+		let state = ProcessLimitState {
+			dl_enabled: true,
+			dl_value: 2.5,
+			dl_unit: SpeedUnit::MBps,
+			dl_blocked: false,
+			ul_enabled: false,
+			ul_value: 7.0,
+			ul_unit: SpeedUnit::GBps,
+			ul_blocked: true,
+		};
+		let config = state.to_process_config();
+		assert_eq!(config.dl_unit, "MBps");
+		assert_eq!(config.ul_unit, "GBps");
+		assert!(ProcessLimitState::from_process_config(&config) == state);
+	}
+
+	// -- LimitFlags -----------------------------------------------------------
+
+	#[test]
+	fn limit_flags_follow_the_state() {
+		let flags = LimitFlags::of(&ProcessLimitState { dl_blocked: true, ul_enabled: true, ul_value: 5.0, ..Default::default() });
+		assert!(flags.dl_active && flags.dl_blocked);
+		assert!(flags.ul_active && !flags.ul_blocked);
+	}
+
+	#[test]
+	fn limit_flags_merge_is_a_logical_or() {
+		let a = LimitFlags { dl_active: true, ..Default::default() };
+		let b = LimitFlags { ul_blocked: true, ul_active: true, ..Default::default() };
+		let merged = a.merge(b);
+		assert!(merged.dl_active && merged.ul_active && merged.ul_blocked && !merged.dl_blocked);
+
+		let none = LimitFlags::default().merge(LimitFlags::default());
+		assert!(!none.dl_active && !none.ul_active && !none.dl_blocked && !none.ul_blocked);
+	}
+
+	// -- Groups and sorting ---------------------------------------------------
+
+	#[test]
+	fn build_groups_collects_instances_and_sums_traffic() {
+		let groups = app().build_groups(sample_stats());
+
+		// One group per name, in order of first appearance.
+		assert_eq!(group_names(&groups), vec!["chrome.exe", "Zoom.exe", "apex.exe"]);
+
+		let chrome = &groups[0];
+		assert_eq!(pids(chrome), vec![30, 20, 25]);
+		assert_eq!(chrome.download_speed, 400.0);
+		assert_eq!(chrome.upload_speed, 8.0);
+		assert_eq!(chrome.download_bytes, 750);
+		assert_eq!(chrome.upload_bytes, 75);
+
+		assert!(app().build_groups(Vec::new()).is_empty());
+	}
+
+	#[test]
+	fn sort_by_download_speed() {
+		let mut app = app();
+		let mut groups = app.build_groups(sample_stats());
+
+		app.sort_groups(&mut groups);
+		assert_eq!(group_names(&groups), vec!["chrome.exe", "Zoom.exe", "apex.exe"]);
+		assert_eq!(pids(&groups[0]), vec![20, 30, 25]);
+
+		app.sort_ascending = true;
+		app.sort_groups(&mut groups);
+		assert_eq!(group_names(&groups), vec!["apex.exe", "Zoom.exe", "chrome.exe"]);
+		assert_eq!(pids(&groups[2]), vec![25, 30, 20]);
+	}
+
+	#[test]
+	fn sort_by_upload_speed() {
+		let mut app = app();
+		app.sort_column = SortColumn::UploadSpeed;
+		let mut groups = app.build_groups(sample_stats());
+
+		app.sort_groups(&mut groups);
+		assert_eq!(group_names(&groups), vec!["Zoom.exe", "apex.exe", "chrome.exe"]);
+		assert_eq!(pids(&groups[2]), vec![30, 25, 20]);
+	}
+
+	#[test]
+	fn sort_by_name_ignores_case() {
+		let mut app = app();
+		app.sort_column = SortColumn::Name;
+		app.sort_ascending = true;
+		let mut groups = app.build_groups(sample_stats());
+
+		app.sort_groups(&mut groups);
+		assert_eq!(group_names(&groups), vec!["apex.exe", "chrome.exe", "Zoom.exe"]);
+		// Instances of one application sort by PID.
+		assert_eq!(pids(&groups[1]), vec![20, 25, 30]);
+
+		app.sort_ascending = false;
+		app.sort_groups(&mut groups);
+		assert_eq!(group_names(&groups), vec!["Zoom.exe", "chrome.exe", "apex.exe"]);
+		assert_eq!(pids(&groups[1]), vec![30, 25, 20]);
+	}
+
+	#[test]
+	fn sort_by_pid_column_orders_groups_by_instance_count() {
+		let mut app = app();
+		app.sort_column = SortColumn::Pid;
+		let mut groups = app.build_groups(sample_stats());
+
+		app.sort_groups(&mut groups);
+		assert_eq!(groups[0].name, "chrome.exe");
+		assert_eq!(pids(&groups[0]), vec![30, 25, 20]);
+	}
+
+	// -- Frozen order ---------------------------------------------------------
+
+	#[test]
+	fn frozen_order_holds_rows_and_puts_new_rows_last() {
+		let app = app();
+		let mut groups = app.build_groups(sample_stats());
+		app.sort_groups(&mut groups);
+		let frozen = FrozenOrder::capture(&groups);
+		assert_eq!(frozen.groups, vec!["chrome.exe", "Zoom.exe", "apex.exe"]);
+		assert_eq!(frozen.procs["chrome.exe"], vec![20, 30, 25]);
+
+		// The traffic changes and a new application and instance start.
+		let mut stats = sample_stats();
+		stats.push(proc(50, "new.exe", 9999.0, 0.0));
+		stats.push(proc(5, "chrome.exe", 9999.0, 0.0));
+		stats[3].download_speed = 5000.0;
+		let mut changed = app.build_groups(stats);
+		app.sort_groups(&mut changed);
+		assert_eq!(group_names(&changed), vec!["chrome.exe", "new.exe", "apex.exe", "Zoom.exe"], "the free sort moves rows");
+
+		frozen.apply(&mut changed);
+		assert_eq!(group_names(&changed), vec!["chrome.exe", "Zoom.exe", "apex.exe", "new.exe"]);
+		assert_eq!(pids(&changed[0]), vec![20, 30, 25, 5]);
+	}
+
+	// -- Pins -----------------------------------------------------------------
+
+	#[test]
+	fn toggle_pin_adds_and_removes() {
+		let mut app = app();
+		let target = PinTarget::Group("chrome.exe".to_string());
+
+		app.toggle_pin(target.clone());
+		app.toggle_pin(PinTarget::Pid(7));
+		assert!(app.is_pinned(&target));
+		assert_eq!(app.pin_rank(&target), Some(0));
+		assert_eq!(app.pin_rank(&PinTarget::Pid(7)), Some(1));
+
+		app.toggle_pin(target.clone());
+		assert!(!app.is_pinned(&target));
+		assert_eq!(app.pin_rank(&PinTarget::Pid(7)), Some(0));
+		assert_eq!(app.pin_rank(&PinTarget::Pid(8)), None);
+	}
+
+	#[test]
+	fn apply_pins_without_pins_keeps_the_order() {
+		let app = app();
+		let mut groups = app.build_groups(sample_stats());
+		app.apply_pins(&mut groups);
+		assert_eq!(group_names(&groups), vec!["chrome.exe", "Zoom.exe", "apex.exe"]);
+	}
+
+	#[test]
+	fn pinned_groups_go_first_in_pin_order() {
+		let mut app = app();
+		let mut groups = app.build_groups(sample_stats());
+		app.toggle_pin(PinTarget::Group("apex.exe".to_string()));
+		app.toggle_pin(PinTarget::Group("Zoom.exe".to_string()));
+
+		app.apply_pins(&mut groups);
+		assert_eq!(group_names(&groups), vec!["apex.exe", "Zoom.exe", "chrome.exe"]);
+	}
+
+	#[test]
+	fn a_pinned_instance_lifts_its_group_and_goes_first_in_the_group() {
+		let mut app = app();
+		let mut groups = app.build_groups(sample_stats());
+		app.toggle_pin(PinTarget::Group("Zoom.exe".to_string()));
+		app.toggle_pin(PinTarget::Pid(25));
+
+		app.apply_pins(&mut groups);
+		assert_eq!(group_names(&groups), vec!["Zoom.exe", "chrome.exe", "apex.exe"]);
+		assert_eq!(pids(&groups[1]), vec![25, 30, 20]);
+	}
+
+	// -- Effective limits -----------------------------------------------------
+
+	#[test]
+	fn instance_limit_overrides_group_limit() {
+		let mut app = app();
+		app.group_states.insert("chrome.exe".to_string(), limited(100.0, 0.0));
+		app.pid_states.insert(20, limited(0.0, 50.0));
+
+		assert!(app.effective_state(30, "chrome.exe") == Some(&limited(100.0, 0.0)));
+		assert!(app.effective_state(20, "chrome.exe") == Some(&limited(0.0, 50.0)));
+		assert!(app.effective_state(40, "apex.exe").is_none());
+
+		let flags = app.flags_for_pid(20, "chrome.exe");
+		assert!(!flags.dl_active && flags.ul_active);
+		let flags = app.flags_for_pid(40, "apex.exe");
+		assert!(!flags.dl_active && !flags.ul_active);
+	}
+
+	#[test]
+	fn group_flags_merge_the_flags_of_all_instances() {
+		let mut app = app();
+		let groups = app.build_groups(sample_stats());
+		app.pid_states.insert(25, ProcessLimitState { ul_blocked: true, ..Default::default() });
+		app.pid_states.insert(30, limited(10.0, 0.0));
+
+		let flags = app.flags_for_group(&groups[0]);
+		assert!(flags.dl_active && flags.ul_active && flags.ul_blocked && !flags.dl_blocked);
+
+		let flags = app.flags_for_group(&groups[2]);
+		assert!(!flags.dl_active && !flags.ul_active);
+	}
+
+	#[test]
+	fn apply_limits_without_a_limiter_does_nothing() {
+		let mut app = app();
+		app.group_states.insert("chrome.exe".to_string(), limited(1.0, 1.0));
+		app.known_pids.insert(20, "chrome.exe".to_string());
+		app.apply_limits();
+	}
+
+	#[test]
+	fn apply_limits_writes_the_effective_limit_of_each_known_pid() {
+		let mut app = app();
+		let limits: LimitsMap = Arc::new(std::sync::RwLock::new(HashMap::new()));
+		// A stale limit that the next push must remove.
+		limits.write().unwrap().insert(999, LimitConfig { download_byterate: Some(1), upload_byterate: None });
+		*app.limits_handle.lock().unwrap() = Some(limits.clone());
+
+		for (pid, name) in [(20, "chrome.exe"), (30, "chrome.exe"), (40, "apex.exe"), (10, "Zoom.exe")] {
+			app.known_pids.insert(pid, name.to_string());
+		}
+		app.group_states.insert("chrome.exe".to_string(), limited(2.0, 0.0));
+		app.group_states.insert("Zoom.exe".to_string(), ProcessLimitState { dl_value: 5.0, ..Default::default() });
+		app.pid_states.insert(30, ProcessLimitState { dl_blocked: true, ul_blocked: true, ..Default::default() });
+		app.pid_states.insert(SYSTEM_PID, limited(0.0, 1.0));
+
+		app.apply_limits();
+		let map = limits.read().unwrap();
+
+		assert!(!map.contains_key(&999), "stale limits must be cleared");
+		assert_eq!(map[&20].download_byterate, Some(2048));
+		assert_eq!(map[&20].upload_byterate, None);
+		assert_eq!(map[&30].download_byterate, Some(0), "the instance block overrides the group limit");
+		assert_eq!(map[&30].upload_byterate, Some(0));
+		assert!(!map.contains_key(&40), "no state, no limit");
+		assert!(!map.contains_key(&10), "a state without an active limit gives no entry");
+		assert_eq!(map[&SYSTEM_PID].upload_byterate, Some(1024));
+		assert_eq!(map.len(), 3);
+	}
+
+	// -- Formatting helpers ---------------------------------------------------
+
+	#[test]
+	fn format_speed_picks_the_unit() {
+		assert_eq!(format_speed(0.0), "0 B/s");
+		assert_eq!(format_speed(0.99), "0 B/s");
+		assert_eq!(format_speed(-5.0), "0 B/s");
+		assert_eq!(format_speed(1.0), "1 B/s");
+		assert_eq!(format_speed(1023.0), "1023 B/s");
+		assert_eq!(format_speed(1024.0), "1.0 KB/s");
+		assert_eq!(format_speed(1536.0), "1.5 KB/s");
+		assert_eq!(format_speed(1_048_576.0), "1.00 MB/s");
+		assert_eq!(format_speed(2.5 * 1_048_576.0), "2.50 MB/s");
+		assert_eq!(format_speed(1_073_741_824.0), "1.00 GB/s");
+		assert_eq!(format_speed(3.0 * 1_073_741_824.0 * 1024.0), "3072.00 GB/s");
+	}
+
+	#[test]
+	fn format_bytes_picks_the_unit() {
+		assert_eq!(format_bytes(0), "0 B");
+		assert_eq!(format_bytes(1023), "1023 B");
+		assert_eq!(format_bytes(1024), "1.0 KB");
+		assert_eq!(format_bytes(1_048_575), "1024.0 KB");
+		assert_eq!(format_bytes(1_048_576), "1.00 MB");
+		assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
+		assert_eq!(format_bytes(u64::MAX), "17179869184.00 GB");
+	}
+
+	#[test]
+	fn format_limit_value_hides_a_zero_fraction() {
+		assert_eq!(format_limit_value(0.0), "0");
+		assert_eq!(format_limit_value(100.0), "100");
+		assert_eq!(format_limit_value(2.5), "2.5");
+		assert_eq!(format_limit_value(2.24), "2.2");
+		assert_eq!(format_limit_value(2.26), "2.3");
+	}
+
+	#[test]
+	fn compare_f64_treats_nan_as_equal() {
+		use std::cmp::Ordering;
+		assert_eq!(compare_f64(1.0, 2.0), Ordering::Less);
+		assert_eq!(compare_f64(2.0, 1.0), Ordering::Greater);
+		assert_eq!(compare_f64(1.0, 1.0), Ordering::Equal);
+		assert_eq!(compare_f64(f64::NAN, 1.0), Ordering::Equal);
+	}
+
+	#[test]
+	fn speed_color_dims_idle_traffic() {
+		let active = egui::Color32::RED;
+		assert_eq!(speed_color(0.0, active), theme::TEXT_WEAK.gamma_multiply(0.7));
+		assert_eq!(speed_color(1.0, active), theme::TEXT);
+		assert_eq!(speed_color(10_239.0, active), theme::TEXT);
+		assert_eq!(speed_color(10_240.0, active), active);
+	}
+}

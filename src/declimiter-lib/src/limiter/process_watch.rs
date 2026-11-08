@@ -212,3 +212,120 @@ mod tests {
 		assert_eq!(exited, vec![pid], "the watcher did not report a process that already ended");
 	}
 }
+
+#[cfg(test)]
+mod more_tests {
+	use super::ProcessWatcher;
+	use std::time::{Duration, Instant};
+
+	fn start_waiting_process() -> std::process::Child {
+		std::process::Command::new("cmd").args(["/c", "pause"]).stdin(std::process::Stdio::piped()).spawn().expect("cannot start the test process")
+	}
+
+	fn wait_for_exit(watcher: &ProcessWatcher) -> Vec<u32> {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while Instant::now() < deadline {
+			let exited = watcher.take_exited();
+			if !exited.is_empty() {
+				return exited;
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		Vec::new()
+	}
+
+	fn watch_count(watcher: &ProcessWatcher) -> usize {
+		watcher.watches.lock().unwrap().len()
+	}
+
+	#[test]
+	fn pid_zero_is_never_watched() {
+		let watcher = ProcessWatcher::default();
+		watcher.watch(0);
+		assert_eq!(watch_count(&watcher), 0);
+		assert!(watcher.take_exited().is_empty());
+	}
+
+	#[test]
+	fn a_pid_that_does_not_exist_is_not_watched() {
+		let watcher = ProcessWatcher::new();
+		// Windows PIDs are multiples of 4, thus this PID never exists.
+		watcher.watch(u32::MAX - 2);
+		assert_eq!(watch_count(&watcher), 0);
+	}
+
+	#[test]
+	fn a_second_watch_of_the_same_pid_does_nothing() {
+		let mut child = start_waiting_process();
+		let pid = child.id();
+
+		let watcher = ProcessWatcher::new();
+		watcher.watch(pid);
+		watcher.watch(pid);
+		assert_eq!(watch_count(&watcher), 1);
+
+		child.kill().unwrap();
+		child.wait().unwrap();
+
+		// One end of the process gives exactly one report.
+		assert_eq!(wait_for_exit(&watcher), vec![pid]);
+		assert_eq!(watch_count(&watcher), 0, "take_exited must release the watch");
+	}
+
+	#[test]
+	fn forget_stops_the_report() {
+		let mut child = start_waiting_process();
+		let pid = child.id();
+
+		let watcher = ProcessWatcher::new();
+		watcher.watch(pid);
+		watcher.forget(pid);
+		assert_eq!(watch_count(&watcher), 0);
+
+		child.kill().unwrap();
+		child.wait().unwrap();
+		std::thread::sleep(Duration::from_millis(200));
+
+		assert!(watcher.take_exited().is_empty(), "a forgotten process must not be reported");
+	}
+
+	#[test]
+	fn forget_of_an_unknown_pid_does_nothing() {
+		let watcher = ProcessWatcher::new();
+		watcher.forget(1234);
+		assert_eq!(watch_count(&watcher), 0);
+	}
+
+	#[test]
+	fn several_processes_are_reported_separately() {
+		let mut first = start_waiting_process();
+		let mut second = start_waiting_process();
+		let (a, b) = (first.id(), second.id());
+
+		let watcher = ProcessWatcher::new();
+		watcher.watch(a);
+		watcher.watch(b);
+		assert_eq!(watch_count(&watcher), 2);
+
+		first.kill().unwrap();
+		first.wait().unwrap();
+		assert_eq!(wait_for_exit(&watcher), vec![a]);
+		assert_eq!(watch_count(&watcher), 1, "the second process is still watched");
+
+		second.kill().unwrap();
+		second.wait().unwrap();
+		assert_eq!(wait_for_exit(&watcher), vec![b]);
+	}
+
+	#[test]
+	fn a_drop_of_the_watcher_releases_the_running_watches() {
+		let mut child = start_waiting_process();
+		let watcher = ProcessWatcher::new();
+		watcher.watch(child.id());
+		// The drop must cancel the wait and must not block or crash.
+		drop(watcher);
+
+		child.kill().unwrap();
+		child.wait().unwrap();
+	}
+}

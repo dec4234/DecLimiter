@@ -1,6 +1,6 @@
 use crate::error::LimiterCLIError;
 use declimiter_lib::limiter::ProcessPair;
-use declimiter_lib::util::{Datarate, find_process, parse_datarate};
+use declimiter_lib::util::{find_process, parse_byterate};
 use ratatui::Frame;
 use ratatui::crossterm::event;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind};
@@ -9,7 +9,8 @@ use ratatui::prelude::{Color, Line, Modifier, Style};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use std::time::Duration;
 
-pub fn init_search() -> Result<Option<(ProcessPair, Datarate)>, LimiterCLIError> {
+/// Returns the selected process and its download limit in bytes per second.
+pub fn init_search() -> Result<Option<(ProcessPair, u64)>, LimiterCLIError> {
 	let result = open_search()?;
 
 	let speed = get_download_speed()?;
@@ -17,6 +18,7 @@ pub fn init_search() -> Result<Option<(ProcessPair, Datarate)>, LimiterCLIError>
 	Ok(result.map(|proc| (proc, speed)))
 }
 
+/// Asks for a download limit in bits per second and returns it in bytes per second.
 pub fn get_download_speed() -> Result<u64, LimiterCLIError> {
 	let mut terminal = ratatui::init();
 
@@ -27,7 +29,7 @@ pub fn get_download_speed() -> Result<u64, LimiterCLIError> {
 			let layout = Layout::vertical([Constraint::Length(3), Constraint::Length(3)]);
 			let [input_area, help_area] = layout.areas(f.area());
 
-			let block = Block::bordered().title(" Set Download Speed (bytes/sec) ");
+			let block = Block::bordered().title(" Set Download Speed (bits/sec) ");
 			let paragraph = Paragraph::new(input.as_str()).block(block).style(Style::default().fg(Color::Yellow));
 
 			f.render_widget(paragraph, input_area);
@@ -42,7 +44,7 @@ pub fn get_download_speed() -> Result<u64, LimiterCLIError> {
 				if key.kind == KeyEventKind::Press {
 					match key.code {
 						KeyCode::Enter => {
-							if let Ok(value) = parse_datarate(&input) {
+							if let Ok(value) = parse_byterate(&input) {
 								break Ok(value);
 							}
 						}

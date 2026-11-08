@@ -68,6 +68,11 @@ impl TokenBucket {
         }
     }
 
+    /// The target rate in bytes per second.
+    pub fn rate(&self) -> u64 {
+        self.rate as u64
+    }
+
     /// Update the target rate.  Keeps current token level (clamped to the new
     /// capacity) so the transition is smooth.
     pub fn set_rate(&mut self, rate: u64) {
@@ -75,5 +80,84 @@ impl TokenBucket {
         self.rate = rate_f;
         self.capacity = (rate_f * 0.05).max(1500.0);
         self.tokens = self.tokens.min(self.capacity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenBucket;
+    use std::time::Duration;
+
+    #[test]
+    fn capacity_is_fifty_ms_of_rate_with_a_minimum_of_one_frame() {
+        // A slow rate gets the minimum capacity of one full frame.
+        let slow = TokenBucket::new(1_000);
+        assert_eq!(slow.capacity, 1500.0);
+        assert_eq!(slow.tokens, 1500.0);
+
+        // A fast rate gets 50 ms of burst.
+        let fast = TokenBucket::new(1_000_000);
+        assert_eq!(fast.capacity, 50_000.0);
+        assert_eq!(fast.tokens, 50_000.0);
+        assert_eq!(fast.rate, 1_000_000.0);
+    }
+
+    #[test]
+    fn consume_within_capacity_has_no_delay() {
+        let mut bucket = TokenBucket::new(1_000_000);
+        assert_eq!(bucket.consume(1500), Duration::ZERO);
+        assert_eq!(bucket.consume(40_000), Duration::ZERO);
+    }
+
+    #[test]
+    fn consume_past_capacity_gives_delay_for_the_debt() {
+        let mut bucket = TokenBucket::new(1_000);
+        // 1500 tokens are in the bucket. A request for 2500 bytes leaves a
+        // debt of approximately 1000 bytes, which at 1000 B/s is 1 second.
+        let delay = bucket.consume(2_500);
+        assert!(delay > Duration::from_millis(900), "delay too short: {delay:?}");
+        assert!(delay <= Duration::from_secs(1), "delay too long: {delay:?}");
+    }
+
+    #[test]
+    fn debt_accumulates_over_consecutive_packets() {
+        let mut bucket = TokenBucket::new(10_000);
+        bucket.consume(1500);
+        let first = bucket.consume(1000);
+        let second = bucket.consume(1000);
+        assert!(first > Duration::ZERO);
+        assert!(second > first, "second delay {second:?} must be longer than first {first:?}");
+    }
+
+    #[test]
+    fn bucket_refills_with_time_but_not_past_capacity() {
+        let mut bucket = TokenBucket::new(100_000);
+        // Empty the bucket (capacity is 5000).
+        bucket.consume(5_000);
+        std::thread::sleep(Duration::from_millis(30));
+        // 30 ms at 100 KB/s refills approximately 3000 tokens.
+        assert_eq!(bucket.consume(2_000), Duration::ZERO);
+
+        let mut idle = TokenBucket::new(100_000);
+        std::thread::sleep(Duration::from_millis(20));
+        idle.consume(0);
+        assert_eq!(idle.tokens, idle.capacity, "tokens must not go above the capacity");
+    }
+
+    #[test]
+    fn set_rate_changes_rate_and_clamps_tokens() {
+        let mut bucket = TokenBucket::new(1_000_000);
+        assert_eq!(bucket.tokens, 50_000.0);
+
+        bucket.set_rate(1_000);
+        assert_eq!(bucket.rate, 1_000.0);
+        assert_eq!(bucket.rate(), 1_000);
+        assert_eq!(bucket.capacity, 1500.0);
+        assert_eq!(bucket.tokens, 1500.0);
+
+        // An increase of the rate does not add tokens.
+        bucket.set_rate(10_000_000);
+        assert_eq!(bucket.capacity, 500_000.0);
+        assert_eq!(bucket.tokens, 1500.0);
     }
 }

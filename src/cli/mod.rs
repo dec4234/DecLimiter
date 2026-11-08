@@ -8,8 +8,7 @@ use crate::error::LimiterCLIError;
 use clap::Parser;
 use clap_derive::Parser;
 use declimiter_lib::limiter::DecLimiter;
-use declimiter_lib::util::Datarate;
-use declimiter_lib::util::parse_datarate;
+use declimiter_lib::util::parse_byterate;
 use futures::try_join;
 use std::time::Duration;
 
@@ -60,13 +59,13 @@ pub struct DecLimiterArgs {
 	#[arg(short, long)]
 	pub pid: Option<u32>,
 
-	/// Download speed limit (e.g., "10mbps", "500kbps")
-	#[arg(short, long, value_parser = parse_datarate)]
-	pub download: Option<Datarate>,
+	/// Download speed limit in bits per second (e.g., "10mbps", "500kbps")
+	#[arg(short, long, value_parser = parse_byterate)]
+	pub download: Option<u64>,
 
-	/// Upload speed limit (e.g., "10mbps", "500kbps")
-	#[arg(short, long, value_parser = parse_datarate)]
-	pub upload: Option<Datarate>,
+	/// Upload speed limit in bits per second (e.g., "10mbps", "500kbps")
+	#[arg(short, long, value_parser = parse_byterate)]
+	pub upload: Option<u64>,
 
 	/// Garbage collection interval in seconds
 	#[arg(short, long, default_value_t = 60)]
@@ -94,4 +93,60 @@ pub async fn execute(args: DecLimiterArgs) -> Result<(), LimiterCLIError> {
 	futures::future::try_join_all(vec).await.map_err(|e| LimiterCLIError::ExecutionError(e.to_string()))?;
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::DecLimiterArgs;
+	use clap::Parser;
+
+	fn parse(args: &[&str]) -> Result<DecLimiterArgs, clap::Error> {
+		DecLimiterArgs::try_parse_from(std::iter::once("declimiter").chain(args.iter().copied()))
+	}
+
+	#[test]
+	fn no_arguments_give_gui_defaults() {
+		let args = parse(&[]).unwrap();
+		assert_eq!(args.pid, None);
+		assert_eq!(args.download, None);
+		assert_eq!(args.upload, None);
+		assert_eq!(args.garbage_collect, 60);
+		assert!(!args.list);
+		assert!(!args.console);
+	}
+
+	#[test]
+	fn long_options_are_parsed() {
+		let args = parse(&["--pid", "1234", "--download", "10M", "--upload", "500kbps", "--garbage-collect", "30", "--console"]).unwrap();
+		assert_eq!(args.pid, Some(1234));
+		// The limits are in bits per second; the fields hold bytes per second.
+		assert_eq!(args.download, Some(1_250_000));
+		assert_eq!(args.upload, Some(62_500));
+		assert_eq!(args.garbage_collect, 30);
+		assert!(args.console);
+		assert!(!args.list);
+	}
+
+	#[test]
+	fn short_options_are_parsed() {
+		let args = parse(&["-p", "8", "-d", "1.5K", "-u", "2m", "-g", "5", "-l"]).unwrap();
+		assert_eq!(args.pid, Some(8));
+		assert_eq!(args.download, Some(187));
+		assert_eq!(args.upload, Some(250_000));
+		assert_eq!(args.garbage_collect, 5);
+		assert!(args.list);
+	}
+
+	#[test]
+	fn invalid_values_are_rejected() {
+		for args in [&["--pid", "abc"][..], &["--pid", "-1"], &["--download", "fast"], &["--upload", "10 MB"], &["--download", "0"], &["--upload", "7bps"], &["--garbage-collect", "-5"], &["--no-such-flag"]] {
+			assert!(parse(args).is_err(), "{args:?} must be rejected");
+		}
+	}
+
+	#[test]
+	fn datarate_error_names_the_bad_value() {
+		let err = parse(&["--download", "fast"]).unwrap_err().to_string();
+		assert!(err.contains("fast"), "{err}");
+	}
 }

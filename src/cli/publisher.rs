@@ -98,3 +98,52 @@ unsafe fn first_translation(block: &[u8]) -> Option<(u16, u16)> {
 		Some((pair[0], pair[1]))
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn system_exe(name: &str) -> String {
+		let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+		format!(r"{root}\System32\{name}")
+	}
+
+	#[test]
+	fn company_of_a_windows_executable_is_microsoft() {
+		let company = company_name(&system_exe("notepad.exe")).expect("notepad must have a company name");
+		assert!(company.contains("Microsoft"), "{company}");
+		assert_eq!(company, company.trim(), "the name must have no extra space");
+		assert!(!company.contains('\0'));
+	}
+
+	#[test]
+	fn company_of_a_missing_file_is_none() {
+		assert_eq!(company_name(r"C:\no\such\dir\declimiter-test.exe"), None);
+	}
+
+	#[test]
+	fn cache_gives_up_after_the_maximum_attempts() {
+		let mut cache = PublisherCache::new();
+		for _ in 0..MAX_ATTEMPTS + 2 {
+			assert_eq!(cache.get("ghost.exe", 0), None);
+		}
+		assert_eq!(cache.entries["ghost.exe"].attempts, MAX_ATTEMPTS);
+	}
+
+	#[test]
+	fn cache_keeps_a_found_name() {
+		let mut child = std::process::Command::new(system_exe("cmd.exe")).args(["/c", "pause"]).stdin(std::process::Stdio::piped()).spawn().expect("cannot start cmd");
+
+		let mut cache = PublisherCache::new();
+		let first = cache.get("cmd.exe", child.id());
+		child.kill().unwrap();
+		child.wait().unwrap();
+
+		let first = first.expect("cmd.exe must have a publisher");
+		assert!(first.contains("Microsoft"), "{first}");
+
+		// The process is gone, but the cache still answers without a new lookup.
+		assert_eq!(cache.get("cmd.exe", 0), Some(first));
+		assert_eq!(cache.entries["cmd.exe"].attempts, 1);
+	}
+}

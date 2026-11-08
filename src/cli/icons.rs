@@ -198,3 +198,79 @@ unsafe fn apply_mask(dc: HDC, mask: HBITMAP, width: u32, height: u32, pixels: &m
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::Mutex;
+
+	/// The shell icon calls are not safe to make from several test threads at
+	/// the same time, thus the tests that read icons hold this lock.
+	static SHELL: Mutex<()> = Mutex::new(());
+
+	fn system_exe(name: &str) -> String {
+		let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+		format!(r"{root}\System32\{name}")
+	}
+
+	#[test]
+	fn exe_path_of_pid_zero_is_none() {
+		assert_eq!(exe_path(0), None);
+	}
+
+	#[test]
+	fn exe_path_of_an_unused_pid_is_none() {
+		// Windows PIDs are multiples of 4, thus this PID never exists.
+		assert_eq!(exe_path(u32::MAX - 2), None);
+	}
+
+	#[test]
+	fn exe_path_of_this_process_is_the_test_executable() {
+		let path = exe_path(std::process::id()).expect("the own path must be readable");
+		let expected = std::env::current_exe().unwrap();
+		assert!(path.eq_ignore_ascii_case(&expected.to_string_lossy()), "{path} is not {expected:?}");
+	}
+
+	#[test]
+	fn icon_of_a_system_executable_is_rgba() {
+		let _shell = SHELL.lock().unwrap_or_else(|e| e.into_inner());
+		let (rgba, width, height) = icon_rgba(&system_exe("notepad.exe")).expect("notepad must have an icon");
+		assert!(width > 0 && height > 0);
+		assert_eq!(rgba.len(), (width * height * 4) as usize);
+		assert!(rgba.chunks_exact(4).any(|p| p[3] != 0), "the icon must have visible pixels");
+	}
+
+	#[test]
+	fn icon_of_a_missing_file_is_none() {
+		let _shell = SHELL.lock().unwrap_or_else(|e| e.into_inner());
+		assert!(icon_rgba(r"C:\no\such\dir\declimiter-test.exe").is_none());
+	}
+
+	#[test]
+	fn cache_gives_up_after_the_maximum_attempts() {
+		let ctx = egui::Context::default();
+		let mut cache = IconCache::new();
+
+		for _ in 0..MAX_ATTEMPTS + 2 {
+			assert!(cache.get(&ctx, "ghost.exe", 0).is_none());
+		}
+		assert_eq!(cache.entries["ghost.exe"].attempts, MAX_ATTEMPTS);
+	}
+
+	#[test]
+	fn cache_keeps_a_loaded_icon() {
+		let _shell = SHELL.lock().unwrap_or_else(|e| e.into_inner());
+		let ctx = egui::Context::default();
+		let mut cache = IconCache::new();
+		let pid = std::process::id();
+
+		let first = cache.get(&ctx, "self", pid);
+		// The test executable can have no icon; then there is nothing to keep.
+		if let Some(first) = first {
+			// A second call with a PID that gives no icon still returns the cache.
+			let second = cache.get(&ctx, "self", 0).expect("the cached icon must stay");
+			assert_eq!(first.id(), second.id());
+			assert_eq!(cache.entries["self"].attempts, 1);
+		}
+	}
+}

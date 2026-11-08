@@ -82,12 +82,22 @@ impl ThrottleState {
 
 	/// Get or create the download bucket, updating the rate if it changed.
 	fn dl(&mut self, rate: u64) -> &mut TokenBucket {
-		self.dl_bucket.get_or_insert_with(|| TokenBucket::new(rate))
+		Self::bucket(&mut self.dl_bucket, rate)
 	}
 
 	/// Get or create the upload bucket, updating the rate if it changed.
 	fn ul(&mut self, rate: u64) -> &mut TokenBucket {
-		self.ul_bucket.get_or_insert_with(|| TokenBucket::new(rate))
+		Self::bucket(&mut self.ul_bucket, rate)
+	}
+
+	/// Get or create a bucket. If the limit changed since the bucket was made,
+	/// the bucket takes the new rate and keeps its tokens.
+	fn bucket(slot: &mut Option<TokenBucket>, rate: u64) -> &mut TokenBucket {
+		let bucket = slot.get_or_insert_with(|| TokenBucket::new(rate));
+		if bucket.rate() != rate {
+			bucket.set_rate(rate);
+		}
+		bucket
 	}
 }
 
@@ -117,7 +127,13 @@ impl DecLimiter {
 			debug!("Available adapter [{}]: {}", i, adapter.get_name());
 		}
 
-		Ok(Self {
+		Ok(Self::empty())
+	}
+
+	/// Creates the shared state with no traffic, flows or limits. This does
+	/// not open the packet filter driver.
+	fn empty() -> Self {
+		Self {
 			map: Arc::new(RwLock::new(HashMap::new())),
 			traffic: Arc::new(std::sync::RwLock::new(HashMap::new())),
 			totals: Arc::new(std::sync::RwLock::new(TotalTrafficCounters {
@@ -130,7 +146,7 @@ impl DecLimiter {
 			})),
 			limits: Arc::new(std::sync::RwLock::new(HashMap::new())),
 			watcher: Arc::new(ProcessWatcher::new()),
-		})
+		}
 	}
 
 	/// Returns a clone of the shared limits map for external mutation (e.g. from the GUI).
@@ -540,5 +556,246 @@ impl DecLimiter {
 				});
 			}
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn inner(name: &str, download_speed: f64, upload_speed: f64) -> ProcessTrafficInner {
+		ProcessTrafficInner {
+			name: name.to_string(),
+			download_bytes: 0,
+			upload_bytes: 0,
+			prev_download_bytes: 0,
+			prev_upload_bytes: 0,
+			download_speed,
+			upload_speed,
+			last_seen: Instant::now(),
+		}
+	}
+
+	fn count(limiter: &DecLimiter, pid: Option<u32>, is_outbound: bool, frame_len: usize) {
+		DecLimiter::count_traffic(&limiter.totals, &limiter.traffic, &limiter.watcher, pid, is_outbound, frame_len);
+	}
+
+	/// Polls `reap_exited` until it returns something, or five seconds pass.
+	fn reap_until_some(limiter: &DecLimiter) -> Vec<u32> {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while Instant::now() < deadline {
+			let exited = limiter.reap_exited();
+			if !exited.is_empty() {
+				return exited;
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		Vec::new()
+	}
+
+	#[test]
+	fn throttle_state_creates_each_bucket_once() {
+		let mut state = ThrottleState::new();
+		assert!(state.dl_bucket.is_none());
+		assert!(state.ul_bucket.is_none());
+
+		state.dl(1_000_000);
+		assert!(state.dl_bucket.is_some());
+		assert!(state.ul_bucket.is_none(), "the download bucket must not create the upload bucket");
+
+		// The second call gives the same bucket, with the tokens already used.
+		assert_eq!(state.dl(1_000_000).consume(50_000), Duration::ZERO);
+		assert!(state.dl(1_000_000).consume(50_000) > Duration::ZERO);
+
+		state.ul(2_000);
+		assert!(state.ul_bucket.is_some());
+	}
+
+	/// A change of a limit in the GUI must also apply to a process that the
+	/// monitor already throttles.
+	#[test]
+	fn throttle_state_follows_a_new_rate() {
+		let mut state = ThrottleState::new();
+		// Empty a bucket at 1000 B/s.
+		state.dl(1_000).consume(1_500);
+		// At 1 MB/s, a debt of 1000 bytes needs approximately 1 ms. At the old
+		// rate it needs 1 second.
+		let delay = state.dl(1_000_000).consume(1_000);
+		assert!(delay < Duration::from_millis(100), "the old rate is still in use: {delay:?}");
+
+		// The upload bucket changes rate separately.
+		state.ul(1_000_000);
+		state.ul(2_000);
+		assert_eq!(state.ul_bucket.as_ref().unwrap().rate(), 2_000);
+		assert_eq!(state.dl_bucket.as_ref().unwrap().rate(), 1_000_000);
+	}
+
+	#[test]
+	fn throttle_state_keeps_tokens_when_the_rate_is_the_same() {
+		let mut state = ThrottleState::new();
+		// Use most of the 50 000 byte burst.
+		assert_eq!(state.dl(1_000_000).consume(45_000), Duration::ZERO);
+		// The same rate must not refill the bucket.
+		assert!(state.dl(1_000_000).consume(10_000) > Duration::ZERO);
+	}
+
+	#[test]
+	fn empty_limiter_has_no_traffic() {
+		let limiter = DecLimiter::empty();
+		assert!(limiter.get_snapshot().is_empty());
+		assert!(limiter.reap_exited().is_empty());
+
+		let totals = limiter.get_totals();
+		assert_eq!(totals.pid, 0);
+		assert_eq!(totals.name, "System");
+		assert_eq!(totals.download_bytes, 0);
+		assert_eq!(totals.upload_bytes, 0);
+		assert_eq!(totals.download_speed, 0.0);
+		assert_eq!(totals.upload_speed, 0.0);
+	}
+
+	#[test]
+	fn limits_gives_the_shared_map() {
+		let limiter = DecLimiter::empty();
+		let limits = limiter.limits();
+		limits.write().unwrap().insert(5, LimitConfig { download_byterate: Some(10), upload_byterate: None });
+
+		assert!(Arc::ptr_eq(&limits, &limiter.limits));
+		assert_eq!(limiter.limits.read().unwrap().get(&5).unwrap().download_byterate, Some(10));
+
+		// A clone of the limiter shares the same state.
+		let copy = limiter.clone();
+		assert!(Arc::ptr_eq(&copy.limits(), &limits));
+	}
+
+	#[test]
+	fn count_traffic_adds_to_totals_by_direction() {
+		let limiter = DecLimiter::empty();
+		count(&limiter, None, false, 1500);
+		count(&limiter, None, false, 500);
+		count(&limiter, None, true, 60);
+
+		let totals = limiter.get_totals();
+		assert_eq!(totals.download_bytes, 2000);
+		assert_eq!(totals.upload_bytes, 60);
+	}
+
+	#[test]
+	fn count_traffic_without_pid_or_with_pid_zero_makes_no_process_entry() {
+		let limiter = DecLimiter::empty();
+		count(&limiter, None, false, 100);
+		count(&limiter, Some(0), true, 100);
+
+		assert!(limiter.get_snapshot().is_empty());
+		let totals = limiter.get_totals();
+		assert_eq!(totals.download_bytes, 100);
+		assert_eq!(totals.upload_bytes, 100);
+	}
+
+	#[test]
+	fn count_traffic_tracks_each_process() {
+		let limiter = DecLimiter::empty();
+		let pid = std::process::id();
+		count(&limiter, Some(pid), false, 1000);
+		count(&limiter, Some(pid), true, 200);
+		count(&limiter, Some(pid), false, 24);
+
+		let snapshot = limiter.get_snapshot();
+		assert_eq!(snapshot.len(), 1);
+		let own = &snapshot[0];
+		assert_eq!(own.pid, pid);
+		assert_eq!(own.download_bytes, 1024);
+		assert_eq!(own.upload_bytes, 200);
+
+		// The name comes from the operating system.
+		let exe = std::env::current_exe().unwrap();
+		let exe_name = exe.file_name().unwrap().to_string_lossy();
+		assert!(own.name.eq_ignore_ascii_case(&exe_name), "name {:?} is not {exe_name:?}", own.name);
+
+		// The process traffic is also part of the totals.
+		let totals = limiter.get_totals();
+		assert_eq!(totals.download_bytes, 1024);
+		assert_eq!(totals.upload_bytes, 200);
+	}
+
+	#[test]
+	fn count_traffic_names_an_unknown_pid_by_number() {
+		let limiter = DecLimiter::empty();
+		// Windows PIDs are multiples of 4, thus this PID never exists.
+		let pid = u32::MAX - 2;
+		count(&limiter, Some(pid), false, 10);
+
+		let snapshot = limiter.get_snapshot();
+		assert_eq!(snapshot[0].name, format!("PID {pid}"));
+	}
+
+	#[test]
+	fn snapshot_is_sorted_by_download_speed_descending() {
+		let limiter = DecLimiter::empty();
+		{
+			let mut traffic = limiter.traffic.write().unwrap();
+			traffic.insert(1, inner("slow", 10.0, 900.0));
+			traffic.insert(2, inner("fast", 5000.0, 0.0));
+			traffic.insert(3, inner("medium", 300.0, 1.0));
+		}
+
+		let snapshot = limiter.get_snapshot();
+		let order: Vec<u32> = snapshot.iter().map(|p| p.pid).collect();
+		assert_eq!(order, vec![2, 3, 1]);
+
+		assert_eq!(snapshot[0].name, "fast");
+		assert_eq!(snapshot[0].download_speed, 5000.0);
+		assert_eq!(snapshot[2].upload_speed, 900.0);
+	}
+
+	#[test]
+	fn snapshot_with_a_nan_speed_does_not_panic() {
+		let limiter = DecLimiter::empty();
+		{
+			let mut traffic = limiter.traffic.write().unwrap();
+			traffic.insert(1, inner("a", 1.0, 0.0));
+			traffic.insert(2, inner("b", f64::NAN, 0.0));
+		}
+		assert_eq!(limiter.get_snapshot().len(), 2);
+	}
+
+	#[test]
+	fn reap_exited_removes_traffic_and_limits_of_an_ended_process() {
+		let limiter = DecLimiter::empty();
+
+		let mut child = std::process::Command::new("cmd").args(["/c", "pause"]).stdin(std::process::Stdio::piped()).spawn().expect("cannot start the test process");
+		let pid = child.id();
+		let other = std::process::id();
+
+		// count_traffic starts to watch a new PID.
+		count(&limiter, Some(pid), false, 100);
+		count(&limiter, Some(other), false, 100);
+		{
+			let mut limits = limiter.limits.write().unwrap();
+			limits.insert(pid, LimitConfig { download_byterate: Some(1), upload_byterate: None });
+			limits.insert(other, LimitConfig { download_byterate: Some(2), upload_byterate: None });
+			limits.insert(0, LimitConfig { download_byterate: Some(3), upload_byterate: None });
+		}
+
+		assert!(limiter.reap_exited().is_empty(), "the process still runs");
+
+		child.kill().expect("cannot stop the test process");
+		child.wait().expect("cannot collect the test process");
+
+		assert_eq!(reap_until_some(&limiter), vec![pid]);
+
+		let pids: Vec<u32> = limiter.get_snapshot().iter().map(|p| p.pid).collect();
+		assert_eq!(pids, vec![other]);
+
+		let limits = limiter.limits.read().unwrap();
+		assert!(!limits.contains_key(&pid), "the limit of the ended process must go");
+		assert!(limits.contains_key(&other));
+		assert!(limits.contains_key(&0), "the system wide limit must stay");
+		drop(limits);
+
+		// The totals keep the bytes of the ended process.
+		assert_eq!(limiter.get_totals().download_bytes, 200);
+		// A second call reports nothing new.
+		assert!(limiter.reap_exited().is_empty());
 	}
 }

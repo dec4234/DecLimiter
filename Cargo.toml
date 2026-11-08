@@ -26,7 +26,7 @@ windows = { version = "0.62", features = [
 ] }
 image = "0.25.10"
 dirs = "7.0.0"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 [build-dependencies]
 winresource = "0.1.34"

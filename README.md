@@ -29,6 +29,11 @@ There are 2 provided ways to limit the speed of a process.
 -g, --garbage-collect = Set the garbage collection delay in seconds [Default: 60]
 ```
 
+Speeds are in bits per second, with an optional unit: `K`, `M`, `G`, `T` or `P`
+(steps of 1000), and an optional `bps` suffix. For example, `-d 10Mbps` limits
+the download to 10 megabits per second (1.25 MB/s). The minimum is `8` (1 byte
+per second).
+
 ## Limitations
 - Currently only works on Windows
 - Currently only supports limiting download speed
