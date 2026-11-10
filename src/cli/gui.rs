@@ -127,25 +127,7 @@ pub fn launch_gui() {
 		options,
 		Box::new(|cc| {
 			configure_style(&cc.egui_ctx);
-			Ok(Box::new(DecLimiterApp {
-				stats,
-				system_totals,
-				monitor_error,
-				limits_handle: limits,
-				exited,
-				group_states,
-				pid_states: HashMap::new(),
-				expanded: HashSet::new(),
-				sort_column: SortColumn::DownloadSpeed,
-				sort_ascending: false,
-				search_query: String::new(),
-				selection: None,
-				known_pids: HashMap::new(),
-				frozen_order: None,
-				icons: IconCache::new(),
-				publishers: PublisherCache::new(),
-				pins: Vec::new(),
-			}))
+			Ok(Box::new(DecLimiterApp::new(stats, system_totals, monitor_error, limits, exited, group_states, true)))
 		}),
 	)
 	.unwrap();
@@ -499,9 +481,43 @@ struct DecLimiterApp {
 	/// The lines the user pinned, in the order they were pinned. Pinned lines
 	/// stay at the top of the table until the process ends.
 	pins: Vec<PinTarget>,
+	/// When false, limit changes are not written to disk. Tests use this so
+	/// that they do not change the saved settings of the user.
+	persist: bool,
 }
 
 impl DecLimiterApp {
+	fn new(
+		stats: Arc<Mutex<Vec<ProcessTraffic>>>,
+		system_totals: Arc<Mutex<ProcessTraffic>>,
+		monitor_error: Arc<Mutex<Option<String>>>,
+		limits_handle: Arc<Mutex<Option<LimitsMap>>>,
+		exited: Arc<Mutex<Vec<u32>>>,
+		group_states: HashMap<String, ProcessLimitState>,
+		persist: bool,
+	) -> Self {
+		Self {
+			stats,
+			system_totals,
+			monitor_error,
+			limits_handle,
+			exited,
+			group_states,
+			pid_states: HashMap::new(),
+			expanded: HashSet::new(),
+			sort_column: SortColumn::DownloadSpeed,
+			sort_ascending: false,
+			search_query: String::new(),
+			selection: None,
+			known_pids: HashMap::new(),
+			frozen_order: None,
+			icons: IconCache::new(),
+			publishers: PublisherCache::new(),
+			pins: Vec::new(),
+			persist,
+		}
+	}
+
 	/// Collects the running processes into one group per application name.
 	fn build_groups(&self, stats: Vec<ProcessTraffic>) -> Vec<AppGroup> {
 		let mut index: HashMap<String, usize> = HashMap::new();
@@ -641,6 +657,9 @@ impl DecLimiterApp {
 
 	/// Writes the per application limits to disk.
 	fn save_to_disk(&self) {
+		if !self.persist {
+			return;
+		}
 		let mut config = ProcessesConfig::new();
 		for (name, state) in &self.group_states {
 			if state.has_any_setting() {
@@ -1271,13 +1290,8 @@ fn limit_editor(ui: &mut egui::Ui, id: &str, state: &mut ProcessLimitState) {
 	ui.horizontal(|ui| {
 		ui.checkbox(&mut state.dl_enabled, "Limit to");
 		ui.add_enabled_ui(state.dl_enabled && !state.dl_blocked, |ui| {
-			number_field(ui, egui::Id::unique(("dl_value", id)), &mut state.dl_value);
-			egui::ComboBox::from_id_salt(("dl_unit", id)).selected_text(state.dl_unit.label()).width(76.0).show_ui(ui, |ui| {
-				enlarge_detail_style(ui);
-				for unit in SpeedUnit::ALL {
-					ui.selectable_value(&mut state.dl_unit, unit, unit.label());
-				}
-			});
+			number_field(ui, egui::Id::unique(("dl_value", id)), "Download limit value", &mut state.dl_value);
+			unit_picker(ui, ("dl_unit", id), "Download limit unit", &mut state.dl_unit);
 		});
 	});
 
@@ -1289,23 +1303,35 @@ fn limit_editor(ui: &mut egui::Ui, id: &str, state: &mut ProcessLimitState) {
 	ui.horizontal(|ui| {
 		ui.checkbox(&mut state.ul_enabled, "Limit to");
 		ui.add_enabled_ui(state.ul_enabled && !state.ul_blocked, |ui| {
-			number_field(ui, egui::Id::unique(("ul_value", id)), &mut state.ul_value);
-			egui::ComboBox::from_id_salt(("ul_unit", id)).selected_text(state.ul_unit.label()).width(76.0).show_ui(ui, |ui| {
-				enlarge_detail_style(ui);
-				for unit in SpeedUnit::ALL {
-					ui.selectable_value(&mut state.ul_unit, unit, unit.label());
-				}
-			});
+			number_field(ui, egui::Id::unique(("ul_value", id)), "Upload limit value", &mut state.ul_value);
+			unit_picker(ui, ("ul_unit", id), "Upload limit unit", &mut state.ul_unit);
 		});
 	});
 }
 
+/// The drop down list of speed units. `name` is the name that screen readers
+/// and UI tests see, because the list has no visible label of its own.
+fn unit_picker(ui: &mut egui::Ui, id_salt: impl egui::AsIdSalt, name: &str, unit: &mut SpeedUnit) {
+	egui::ComboBox::from_id_salt(id_salt)
+		.selected_text(unit.label())
+		.width(76.0)
+		.show_ui(ui, |ui| {
+			enlarge_detail_style(ui);
+			for option in SpeedUnit::ALL {
+				ui.selectable_value(unit, option, option.label());
+			}
+		})
+		.response
+		.accessible_name(name);
+}
+
 /// A text field for a speed value. The value changes only when the field
-/// loses focus, so a limit is not applied while the user types.
-fn number_field(ui: &mut egui::Ui, id: egui::Id, value: &mut f64) {
+/// loses focus, so a limit is not applied while the user types. `name` is the
+/// name that screen readers and UI tests see.
+fn number_field(ui: &mut egui::Ui, id: egui::Id, name: &str, value: &mut f64) {
 	let buffer_id = id.with("buffer");
 	let mut text = ui.data(|d| d.get_temp::<String>(buffer_id)).unwrap_or_else(|| format_limit_value(*value));
-	let response = ui.add(egui::TextEdit::singleline(&mut text).id(id).desired_width(80.0));
+	let response = ui.add(egui::TextEdit::singleline(&mut text).id(id).desired_width(80.0)).accessible_name(name);
 
 	if response.lost_focus() {
 		if let Ok(parsed) = text.trim().parse::<f64>() {
@@ -1395,6 +1421,9 @@ fn speed_color(bytes_per_sec: f64, active: egui::Color32) -> egui::Color32 {
 }
 
 #[cfg(test)]
+mod ui_tests;
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 
@@ -1410,25 +1439,15 @@ mod tests {
 	}
 
 	fn app() -> DecLimiterApp {
-		DecLimiterApp {
-			stats: Arc::new(Mutex::new(Vec::new())),
-			system_totals: Arc::new(Mutex::new(proc(0, "System", 0.0, 0.0))),
-			monitor_error: Arc::new(Mutex::new(None)),
-			limits_handle: Arc::new(Mutex::new(None)),
-			exited: Arc::new(Mutex::new(Vec::new())),
-			group_states: HashMap::new(),
-			pid_states: HashMap::new(),
-			expanded: HashSet::new(),
-			sort_column: SortColumn::DownloadSpeed,
-			sort_ascending: false,
-			search_query: String::new(),
-			selection: None,
-			known_pids: HashMap::new(),
-			frozen_order: None,
-			icons: IconCache::new(),
-			publishers: PublisherCache::new(),
-			pins: Vec::new(),
-		}
+		DecLimiterApp::new(
+			Arc::new(Mutex::new(Vec::new())),
+			Arc::new(Mutex::new(proc(0, "System", 0.0, 0.0))),
+			Arc::new(Mutex::new(None)),
+			Arc::new(Mutex::new(None)),
+			Arc::new(Mutex::new(Vec::new())),
+			HashMap::new(),
+			false,
+		)
 	}
 
 	/// The sample traffic: three applications, one of them with three instances.

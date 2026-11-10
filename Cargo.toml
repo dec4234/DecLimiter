@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.54.1", features = ["full"] }
-log = "0.4.34"
+log = "0.4.35"
 simple_logger = "5.2.0"
 clap = { version = "4.6.7", features = ["default", "color", "help", "suggestions", "error-context"] }
 clap_derive = "4.6.7"
@@ -30,3 +30,6 @@ rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 [build-dependencies]
 winresource = "0.1.34"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["eframe"] }
