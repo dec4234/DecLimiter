@@ -42,6 +42,7 @@ fn test_app(stats: Vec<ProcessTraffic>) -> DecLimiterApp {
 		Arc::new(Mutex::new(stats)),
 		Arc::new(Mutex::new(proc(0, "System", 2048.0, 1024.0))),
 		Arc::new(Mutex::new(None)),
+		Arc::new(Mutex::new(Startup::Ready)),
 		Arc::new(Mutex::new(None)),
 		Arc::new(Mutex::new(Vec::new())),
 		HashMap::new(),
@@ -476,4 +477,62 @@ fn monitor_error_replaces_the_table() {
 	harness.get_by_label("Monitor Error");
 	harness.get_by_label("Driver not found");
 	assert!(harness.query_by_label("chrome.exe").is_none());
+}
+
+#[test]
+fn startup_status_replaces_the_table() {
+	let app = test_app(sample_stats());
+	*app.startup.lock().unwrap() = Startup::Busy("Installing the driver".to_string());
+	// The spinner repaints all the time, thus run a fixed number of frames.
+	let mut harness = Harness::builder().with_size(egui::vec2(980.0, 620.0)).build_eframe(|cc| {
+		configure_style(&cc.egui_ctx);
+		app
+	});
+	harness.run_steps(2);
+
+	harness.get_by_label("Installing the driver");
+	assert!(harness.query_by_label("chrome.exe").is_none());
+}
+
+/// Shows the install prompt and returns the receiver of the answer.
+fn install_prompt_harness() -> (Harness<'static, DecLimiterApp>, std::sync::mpsc::Receiver<bool>) {
+	let app = test_app(sample_stats());
+	let (answer, reply) = std::sync::mpsc::channel();
+	*app.startup.lock().unwrap() = Startup::AskInstall(answer);
+	let mut harness = Harness::builder().with_size(egui::vec2(980.0, 620.0)).build_eframe(|cc| {
+		configure_style(&cc.egui_ctx);
+		app
+	});
+	harness.run_steps(2);
+	(harness, reply)
+}
+
+#[test]
+fn install_prompt_replaces_the_table() {
+	let (harness, reply) = install_prompt_harness();
+	harness.get_by_label("Driver Required");
+	harness.get_by_label_contains("github.com/wiresock/ndisapi");
+	assert!(harness.query_by_label("chrome.exe").is_none());
+	assert!(reply.try_recv().is_err(), "no answer must be sent before a click");
+}
+
+#[test]
+fn install_button_sends_yes() {
+	let (mut harness, reply) = install_prompt_harness();
+	harness.get_by_label("Install").click();
+	harness.run_steps(2);
+
+	assert_eq!(reply.try_recv(), Ok(true));
+	assert!(harness.query_by_label("Driver Required").is_none());
+	harness.get_by_label("Please wait...");
+}
+
+#[test]
+fn cancel_button_sends_no() {
+	let (mut harness, reply) = install_prompt_harness();
+	harness.get_by_label("Cancel").click();
+	harness.run_steps(2);
+
+	assert_eq!(reply.try_recv(), Ok(false));
+	assert!(harness.query_by_label("Driver Required").is_none());
 }

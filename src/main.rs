@@ -1,8 +1,10 @@
 //! DecLimiter - Network bandwidth limiter for Windows
 //! Uses Windows Packet Filter (ndisapi) for transparent packet interception.
-//! Requires WinpkFilter driver to be installed: https://www.ntkernel.com/windows-packet-filter/
+//! The executable contains the Windows Packet Filter installer and installs the
+//! driver on the first start if it is missing.
 
 mod cli;
+mod driver;
 mod error;
 pub mod config;
 
@@ -26,7 +28,7 @@ async fn main() {
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("elevated") || err_str.contains("Access") || err_str.contains("failed to load") {
-                eprintln!("Error: Access denied or driver not found. Please run DecLimiter as Administrator and ensure WinpkFilter driver is installed.");
+                eprintln!("Error: Access denied or driver not found. Please run DecLimiter as Administrator.");
             } else {
                 eprintln!("Error: {}", err_str);
             }

@@ -101,6 +101,15 @@ impl ThrottleState {
 	}
 }
 
+/// The device name of the Windows Packet Filter driver.
+const DRIVER_NAME: &str = "NDISRD";
+
+/// Returns true if the Windows Packet Filter driver is installed and this
+/// process can open it.
+pub fn driver_available() -> bool {
+	Ndisapi::new(DRIVER_NAME).is_ok()
+}
+
 #[derive(Clone)]
 pub struct DecLimiter {
 	map: Arc<RwLock<HashMap<FlowAddress, FlowEntry>>>,
@@ -113,7 +122,7 @@ pub struct DecLimiter {
 
 impl DecLimiter {
 	pub fn new() -> Result<Self, DecLimiterError> {
-		let driver = Ndisapi::new("NDISRD").map_err(DecLimiterError::WindowsError)?;
+		let driver = Ndisapi::new(DRIVER_NAME).map_err(DecLimiterError::WindowsError)?;
 
 		debug!("Detected Windows Packet Filter version {}", driver.get_version().map_err(DecLimiterError::WindowsError)?);
 
@@ -243,7 +252,7 @@ impl DecLimiter {
 		tokio::task::spawn_blocking(move || {
 			debug!("Starting speed limiter for PID: {} (download: {:?}, upload: {:?})", pid, download_byterate, upload_byterate);
 
-			let driver = Ndisapi::new("NDISRD").map_err(DecLimiterError::WindowsError)?;
+			let driver = Ndisapi::new(DRIVER_NAME).map_err(DecLimiterError::WindowsError)?;
 			let (adapter_handles, events) = adapter_management::setup_adapters(&driver)?;
 
 			let mut packet = IntermediateBuffer::default();
@@ -286,7 +295,7 @@ impl DecLimiter {
 
 		tokio::task::spawn_blocking(move || {
 			debug!("Starting packet monitor...");
-			let driver = Ndisapi::new("NDISRD").map_err(DecLimiterError::WindowsError)?;
+			let driver = Ndisapi::new(DRIVER_NAME).map_err(DecLimiterError::WindowsError)?;
 			let (adapter_handles, events) = adapter_management::setup_adapters(&driver)?;
 
 			let mut packet = IntermediateBuffer::default();

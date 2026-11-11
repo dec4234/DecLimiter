@@ -10,6 +10,7 @@ use egui_extras::{Column, TableBuilder};
 use crate::cli::icons::IconCache;
 use crate::cli::publisher::PublisherCache;
 use crate::config::{self, ProcessConfig, ProcessesConfig};
+use crate::driver;
 
 const SYSTEM_PID: u32 = 0;
 const ROW_HEIGHT: f32 = 24.0;
@@ -49,6 +50,17 @@ mod theme {
 	pub const LIMITED: Color32 = Color32::from_rgb(0xE3, 0xA8, 0x21);
 }
 
+/// What the window shows while the monitor starts.
+enum Startup {
+	/// The monitor runs. The window shows the table.
+	Ready,
+	/// The window shows a spinner and this message.
+	Busy(String),
+	/// The driver is missing. The window asks the user to install it, and
+	/// sends the answer (true to install) through the sender.
+	AskInstall(std::sync::mpsc::Sender<bool>),
+}
+
 /// Launch the GUI network monitor window.
 pub fn launch_gui() {
 	simple_logger::init_with_level(log::Level::Debug).ok();
@@ -63,6 +75,8 @@ pub fn launch_gui() {
 		upload_speed: 0.0,
 	}));
 	let monitor_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+	// What to show in place of the table while the monitor starts.
+	let startup: Arc<Mutex<Startup>> = Arc::new(Mutex::new(Startup::Busy("Starting...".to_string())));
 	let limits: Arc<Mutex<Option<LimitsMap>>> = Arc::new(Mutex::new(None));
 	// PIDs of the processes that ended, which the interface has not yet read.
 	let exited: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -70,15 +84,34 @@ pub fn launch_gui() {
 	let stats_bg = stats.clone();
 	let totals_bg = system_totals.clone();
 	let error_bg = monitor_error.clone();
+	let startup_bg = startup.clone();
 	let limits_bg = limits.clone();
 	let exited_bg = exited.clone();
 	thread::spawn(move || {
 		let rt = tokio::runtime::Runtime::new().unwrap();
 		rt.block_on(async {
+			let installed = driver::ensure_ready(
+				|| {
+					// Show the prompt, then wait for the answer. If the window
+					// closes first, the sender is dropped, which means no.
+					let (answer, reply) = std::sync::mpsc::channel();
+					*startup_bg.lock().unwrap() = Startup::AskInstall(answer);
+					reply.recv().unwrap_or(false)
+				},
+				|| {
+					*startup_bg.lock().unwrap() = Startup::Busy(format!("Downloading and installing the Windows Packet Filter driver {}.\nPlease wait...", driver::WPF_VERSION));
+				},
+			);
+			*startup_bg.lock().unwrap() = Startup::Ready;
+			if let Err(e) = installed {
+				*error_bg.lock().unwrap() = Some(e.to_string());
+				return;
+			}
+
 			let limiter = match DecLimiter::new() {
 				Ok(l) => l,
 				Err(e) => {
-					*error_bg.lock().unwrap() = Some(format!("Failed to initialize: {}\n\nMake sure:\n1. WinpkFilter driver is installed\n2. Running as Administrator", e));
+					*error_bg.lock().unwrap() = Some(format!("Failed to initialize: {}\n\nMake sure that DecLimiter runs as Administrator.", e));
 					return;
 				}
 			};
@@ -127,7 +160,7 @@ pub fn launch_gui() {
 		options,
 		Box::new(|cc| {
 			configure_style(&cc.egui_ctx);
-			Ok(Box::new(DecLimiterApp::new(stats, system_totals, monitor_error, limits, exited, group_states, true)))
+			Ok(Box::new(DecLimiterApp::new(stats, system_totals, monitor_error, startup, limits, exited, group_states, true)))
 		}),
 	)
 	.unwrap();
@@ -456,6 +489,8 @@ struct DecLimiterApp {
 	stats: Arc<Mutex<Vec<ProcessTraffic>>>,
 	system_totals: Arc<Mutex<ProcessTraffic>>,
 	monitor_error: Arc<Mutex<Option<String>>>,
+	/// What to show in place of the table while the monitor starts.
+	startup: Arc<Mutex<Startup>>,
 	limits_handle: Arc<Mutex<Option<LimitsMap>>>,
 	/// PIDs of the processes that ended since the last frame.
 	exited: Arc<Mutex<Vec<u32>>>,
@@ -491,6 +526,7 @@ impl DecLimiterApp {
 		stats: Arc<Mutex<Vec<ProcessTraffic>>>,
 		system_totals: Arc<Mutex<ProcessTraffic>>,
 		monitor_error: Arc<Mutex<Option<String>>>,
+		startup: Arc<Mutex<Startup>>,
 		limits_handle: Arc<Mutex<Option<LimitsMap>>>,
 		exited: Arc<Mutex<Vec<u32>>>,
 		group_states: HashMap<String, ProcessLimitState>,
@@ -500,6 +536,7 @@ impl DecLimiterApp {
 			stats,
 			system_totals,
 			monitor_error,
+			startup,
 			limits_handle,
 			exited,
 			group_states,
@@ -687,6 +724,48 @@ impl eframe::App for DecLimiterApp {
 			});
 			return;
 		}
+
+		let mut startup = self.startup.lock().unwrap();
+		if let Startup::AskInstall(answer) = &*startup {
+			let mut reply = None;
+			egui::CentralPanel::default().show(root, |ui| {
+				ui.vertical_centered(|ui| {
+					ui.add_space(80.0);
+					ui.heading(egui::RichText::new("Driver Required").color(theme::TEXT_STRONG).size(24.0));
+					ui.add_space(20.0);
+					ui.set_max_width(560.0);
+					ui.label(egui::RichText::new(driver::install_prompt()).color(theme::TEXT).size(15.0));
+					ui.add_space(24.0);
+					ui.horizontal(|ui| {
+						// Center the two buttons.
+						ui.add_space((ui.available_width() - 200.0).max(0.0) / 2.0);
+						if ui.add_sized([95.0, 28.0], egui::Button::new(egui::RichText::new("Install").color(theme::TEXT_STRONG)).fill(theme::ACCENT)).clicked() {
+							reply = Some(true);
+						}
+						if ui.add_sized([95.0, 28.0], egui::Button::new("Cancel")).clicked() {
+							reply = Some(false);
+						}
+					});
+				});
+			});
+			if let Some(reply) = reply {
+				let _ = answer.send(reply);
+				*startup = Startup::Busy("Please wait...".to_string());
+			}
+			return;
+		}
+		if let Startup::Busy(status) = &*startup {
+			egui::CentralPanel::default().show(root, |ui| {
+				ui.vertical_centered(|ui| {
+					ui.add_space(100.0);
+					ui.spinner();
+					ui.add_space(20.0);
+					ui.label(egui::RichText::new(status).color(theme::TEXT).size(16.0));
+				});
+			});
+			return;
+		}
+		drop(startup);
 
 		let mut stats = self.stats.lock().unwrap().clone();
 
@@ -1443,6 +1522,7 @@ mod tests {
 			Arc::new(Mutex::new(Vec::new())),
 			Arc::new(Mutex::new(proc(0, "System", 0.0, 0.0))),
 			Arc::new(Mutex::new(None)),
+			Arc::new(Mutex::new(Startup::Ready)),
 			Arc::new(Mutex::new(None)),
 			Arc::new(Mutex::new(Vec::new())),
 			HashMap::new(),

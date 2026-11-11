@@ -121,8 +121,47 @@ pub fn find_process(process_name: &str) -> Vec<ProcessPair> {
 	vec
 }
 
+/// Returns true if this process runs as Administrator (elevated). The packet
+/// filter driver needs this.
+pub fn is_elevated() -> bool {
+	use windows::Win32::Foundation::{CloseHandle, HANDLE};
+	use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+	use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+	// Safety: the token handle is valid after OpenProcessToken succeeds and is
+	// closed exactly once. The buffer has the size of TOKEN_ELEVATION.
+	unsafe {
+		let mut token = HANDLE::default();
+		if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+			return false;
+		}
+
+		let mut elevation = TOKEN_ELEVATION::default();
+		let mut size = 0u32;
+		let result = GetTokenInformation(token, TokenElevation, Some(&mut elevation as *mut _ as *mut _), size_of::<TOKEN_ELEVATION>() as u32, &mut size);
+		let _ = CloseHandle(token);
+
+		result.is_ok() && elevation.TokenIsElevated != 0
+	}
+}
+
 #[cfg(test)]
 mod tests {
+	/// The result must agree with Windows: only an elevated process can open
+	/// the service manager with full access.
+	#[test]
+	fn is_elevated_agrees_with_the_service_manager() {
+		use windows::Win32::System::Services::{CloseServiceHandle, OpenSCManagerW, SC_MANAGER_ALL_ACCESS};
+
+		let full_access = unsafe { OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS) };
+		let can_manage = full_access.is_ok();
+		if let Ok(handle) = full_access {
+			let _ = unsafe { CloseServiceHandle(handle) };
+		}
+
+		assert_eq!(super::is_elevated(), can_manage);
+	}
+
 	#[test]
 	fn test_parse_datarate() {
 		use super::parse_datarate;

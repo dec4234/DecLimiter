@@ -4,12 +4,14 @@ mod process_list;
 mod publisher;
 
 use crate::cli::process_list::init_search;
+use crate::driver;
 use crate::error::LimiterCLIError;
 use clap::Parser;
 use clap_derive::Parser;
 use declimiter_lib::limiter::DecLimiter;
 use declimiter_lib::util::parse_byterate;
 use futures::try_join;
+use std::io::{BufRead, Write};
 use std::time::Duration;
 
 /// Hide the console window by detaching from it.
@@ -31,6 +33,7 @@ pub async fn handle_startup() -> Result<bool, LimiterCLIError> {
 	if args.list {
 		// Interactive TUI process selector + speed limiter
 		if let Some((proc, speed)) = init_search()? {
+			prepare_driver(args.install_driver)?;
 			let limiter = DecLimiter::new()?;
 
 			try_join!(async { limiter.start().await.expect("Task panicked") }, async { limiter.limit_speed_pid(proc.0, Some(speed), None).await.expect("Task panicked") }, async {
@@ -50,6 +53,28 @@ pub async fn handle_startup() -> Result<bool, LimiterCLIError> {
 		gui::launch_gui();
 		Ok(true)
 	}
+}
+
+/// Installs the Windows Packet Filter driver if it is missing. Asks the user
+/// first, unless `install_without_prompt` is true.
+fn prepare_driver(install_without_prompt: bool) -> Result<(), LimiterCLIError> {
+	driver::ensure_ready(
+		|| install_without_prompt || ask_to_install(&mut std::io::stdin().lock(), &mut std::io::stdout()),
+		|| println!("Downloading and installing the Windows Packet Filter driver {}. Please wait...", driver::WPF_VERSION),
+	)?;
+	Ok(())
+}
+
+/// Shows the install prompt and reads the answer. Only "y" or "yes" agrees.
+fn ask_to_install(input: &mut impl BufRead, output: &mut impl Write) -> bool {
+	let _ = write!(output, "{}\n\nInstall the driver now? [y/N] ", driver::install_prompt());
+	let _ = output.flush();
+
+	let mut answer = String::new();
+	if input.read_line(&mut answer).is_err() {
+		return false;
+	}
+	matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 #[derive(Parser, Debug)]
@@ -78,10 +103,15 @@ pub struct DecLimiterArgs {
 	/// Show the console window (hidden by default in GUI mode)
 	#[arg(long)]
 	pub console: bool,
+
+	/// Install the Windows Packet Filter driver without a prompt if it is missing
+	#[arg(long)]
+	pub install_driver: bool,
 }
 
 pub async fn execute(args: DecLimiterArgs) -> Result<(), LimiterCLIError> {
 	let pid = args.pid.expect("PID is required for direct mode");
+	prepare_driver(args.install_driver)?;
 	let limiter = DecLimiter::new()?;
 
 	let mut vec = vec![limiter.start(), limiter.garbage_collect_flows(Duration::from_secs(args.garbage_collect as u64))];
@@ -113,6 +143,7 @@ mod tests {
 		assert_eq!(args.garbage_collect, 60);
 		assert!(!args.list);
 		assert!(!args.console);
+		assert!(!args.install_driver);
 	}
 
 	#[test]
@@ -148,5 +179,29 @@ mod tests {
 	fn datarate_error_names_the_bad_value() {
 		let err = parse(&["--download", "fast"]).unwrap_err().to_string();
 		assert!(err.contains("fast"), "{err}");
+	}
+
+	#[test]
+	fn install_driver_flag_is_parsed() {
+		assert!(parse(&["--pid", "1", "--install-driver"]).unwrap().install_driver);
+	}
+
+	#[test]
+	fn install_prompt_needs_a_yes() {
+		let ask = |text: &str| {
+			let mut output = Vec::new();
+			let agreed = super::ask_to_install(&mut text.as_bytes(), &mut output);
+			let shown = String::from_utf8(output).unwrap();
+			assert!(shown.contains("Windows Packet Filter"), "{shown}");
+			assert!(shown.ends_with("[y/N] "), "{shown}");
+			agreed
+		};
+
+		for yes in ["y\n", "Y\r\n", "yes\n", "  YES  \n"] {
+			assert!(ask(yes), "{yes:?} must agree");
+		}
+		for no in ["\n", "n\n", "no\n", "yep\n", ""] {
+			assert!(!ask(no), "{no:?} must not agree");
+		}
 	}
 }

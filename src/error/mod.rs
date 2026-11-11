@@ -12,6 +12,8 @@ pub enum LimiterCLIError {
 	JoinError(#[from] tokio::task::JoinError),
 	#[error("DecLimiter error: {0}")]
 	DecLimiterError(#[from] declimiter_lib::error::DecLimiterError),
+	#[error("Driver error: {0}")]
+	DriverInstall(#[from] crate::driver::DriverInstallError),
 }
 
 #[cfg(test)]
