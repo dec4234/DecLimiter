@@ -4,14 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ndisapi = "0.6"
-etherparse = "0.19.0"
-log = "0.4.29"
+ndisapi = "0.7.0"
+etherparse = "0.21.0"
+log = "0.4.35"
 derive-new = "0.7.0"
-tokio = { version = "1.51", features = ["rt-multi-thread", "sync", "time"]}
-thiserror = "2.0.18"
-regex = "1.12.3"
-sysinfo = { version = "0.38.4", features = ["windows", "default"]}
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time"]}
+thiserror = "2.0.21"
+regex = "1.13.1"
+sysinfo = { version = "0.40.1", features = ["default"]}
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

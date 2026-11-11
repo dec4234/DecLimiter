@@ -93,7 +93,7 @@ fn multiple(unit: &str) -> u64 {
 /// Retrieves the process name for a given PID using the sysinfo crate.
 /// Returns None if the PID does not exist or cannot be accessed.
 pub fn get_process_name(pid: u32) -> Option<String> {
-	let mut sys = System::new();
+	let mut sys = System::new().ok()?;
 
 	let sys_pid = Pid::from_u32(pid);
 	sys.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
@@ -110,7 +110,9 @@ pub fn get_process_name(pid: u32) -> Option<String> {
 /// A vector of PIDs (`Vec<(u32, String)>`) found with that name. u32 is pid and String is the process name.
 pub fn find_process(process_name: &str) -> Vec<ProcessPair> {
 	let refresh_kind = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
-	let sys = System::new_with_specifics(refresh_kind);
+	let Ok(sys) = System::new_with_specifics(refresh_kind) else {
+		return Vec::new();
+	};
 
 	let mut vec = Vec::new();
 
